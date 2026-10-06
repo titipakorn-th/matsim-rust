@@ -241,6 +241,10 @@ origin and destination are the same link returns zero time and distance, as MATS
 intrazonal trips. Failed responses include `failure_category`: `malformed_request`,
 `invalid_request`, `invalid_link`, `missing_person`, `no_path`, or `service_error`.
 
+A response without a `failure_category` key comes from an older `local_qsim`, not from this
+version. Clients degrade those to `service_error`, which hides which failures are ordinary
+`no_path` answers, so check the binary's build when every failure looks the same.
+
 For `pt` requests that no transit line connects, the transit router falls back to the car router
 when one is configured, including for requests without a person. Without a fallback the response
 reports the no-path error. See `rust_qsim/tests/resources/equil/equil-config-silo-routing.yml` for a
