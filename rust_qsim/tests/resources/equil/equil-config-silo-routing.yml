@@ -8,7 +8,7 @@ modules:
         typical_duration_s: 28800.0
   network:
     type: Network
-    path: ./assets/equil/equil-network.xml
+    path: ./tests/resources/equil/equil-network-with-island.xml
   population:
     type: Population
     path: ./assets/equil/equil-1-plan.xml

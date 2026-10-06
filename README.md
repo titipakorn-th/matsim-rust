@@ -220,6 +220,11 @@ The service binds to a free port on `127.0.0.1` and writes its address (for exam
 `127.0.0.1:41235`) to the ready file once it accepts connections. The process then keeps serving
 until it is killed.
 
+The config must list the modes to route in `routing.network_modes` (for example `[ "car" ]`).
+Without it no network router exists: QSim stops in prepare-for-sim for plans with network legs,
+and route requests for that mode fail with `invalid_request`. QSim also scores every plan, so
+`scoring` needs parameters for each activity type, mode, and subpopulation in the population.
+
 The protocol is line-delimited JSON: one request object per line, one response object per line.
 
 ```json
@@ -239,7 +244,8 @@ intrazonal trips. Failed responses include `failure_category`: `malformed_reques
 For `pt` requests that no transit line connects, the transit router falls back to the car router
 when one is configured, including for requests without a person. Without a fallback the response
 reports the no-path error. See `rust_qsim/tests/resources/equil/equil-config-silo-routing.yml` for a
-minimal config used by the integration test.
+minimal config used by the integration test. Its network adds an unreachable `island` link to the
+equil network, so the tests can produce a `no_path` answer.
 
 ## Reanalyze a completed run
 

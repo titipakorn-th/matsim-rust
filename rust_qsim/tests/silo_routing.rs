@@ -106,6 +106,7 @@ fn routes_a_car_leg_between_two_links() {
     let request = car_request(HOME_LINK, WORK_LINK, START, WORK_COORD);
     let first = client.request(&request);
     assert_eq!(first["error"], Value::Null);
+    assert_eq!(first["failure_category"], Value::Null);
     assert_eq!(first["distance_meters"], 25000.0);
     assert!(first["travel_time_seconds"].as_f64().unwrap() > 0.0);
 
@@ -187,6 +188,23 @@ fn missing_mode_and_invalid_values_are_reported() {
     let malformed = client.request("{ not json");
     assert!(!error_of(&malformed).is_empty());
     assert_eq!(category_of(&malformed), "malformed_request");
+    assert_eq!(
+        client.request(&car_request(HOME_LINK, WORK_LINK, START, WORK_COORD))["error"],
+        Value::Null
+    );
+}
+
+#[deterministic_id_test(rust_qsim)]
+fn disconnected_link_is_a_no_path_and_the_connection_stays_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut client = start_route_service(&directory.path().join("routing-service.address"));
+
+    // The test network has a car link that no route reaches. SILO counts this as a genuinely
+    // unroutable pair rather than a defect, so it must be told apart from the other failures.
+    let response = client.request(&car_request(HOME_LINK, "island", START, (30500.0, 30000.0)));
+    assert!(!error_of(&response).is_empty());
+    assert_eq!(category_of(&response), "no_path");
+
     assert_eq!(
         client.request(&car_request(HOME_LINK, WORK_LINK, START, WORK_COORD))["error"],
         Value::Null
