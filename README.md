@@ -227,13 +227,14 @@ The protocol is line-delimited JSON: one request object per line, one response o
 ```
 
 ```json
-{"travel_time_seconds": 1234.0, "distance_meters": 25000.0, "error": null}
+{"travel_time_seconds": 1234.0, "distance_meters": 25000.0, "error": null, "failure_category": null}
 ```
 
 `person_id` is optional. Unknown links or persons, non-finite coordinates, and negative departure
 times produce a response with `error` set instead of closing the connection. A request whose
 origin and destination are the same link returns zero time and distance, as MATSim does for
-intrazonal trips.
+intrazonal trips. Failed responses include `failure_category`: `malformed_request`,
+`invalid_request`, `invalid_link`, `missing_person`, `no_path`, or `service_error`.
 
 For `pt` requests that no transit line connects, the transit router falls back to the car router
 when one is configured, including for requests without a person. Without a fallback the response
