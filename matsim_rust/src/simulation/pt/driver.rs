@@ -125,9 +125,10 @@ impl TransitDriver {
         self.next_stop
     }
 
-    pub(crate) fn next_stop_link(&self) -> &Id<Link> {
+    /// The link of the stop the vehicle serves next, `None` once the route's last one is served.
+    pub(crate) fn next_stop_link(&self) -> Option<&Id<Link>> {
         match self.run_leg() {
-            RunLeg::Service { route, .. } => &route.stops[self.next_stop].link,
+            RunLeg::Service { route, .. } => route.stops.get(self.next_stop).map(|stop| &stop.link),
             RunLeg::Deadhead { .. } => unreachable!("timetable services have no deadheads"),
         }
     }

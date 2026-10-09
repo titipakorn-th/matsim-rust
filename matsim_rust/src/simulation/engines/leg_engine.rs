@@ -4,6 +4,7 @@ use crate::simulation::agents::{SimulationAgentLogic, SimulationAgentState};
 use crate::simulation::config::QSim;
 use crate::simulation::controller::ThreadLocalComputationalEnvironment;
 use crate::simulation::engines::emit_partition_enter_events_for_vehicle;
+use crate::simulation::engines::emit_partition_leave_events_for_vehicle;
 use crate::simulation::engines::leg_engine::ResponsibleEngine::{
     Leg, Teleportation, TimetableTransit, Transit,
 };
@@ -16,7 +17,7 @@ use crate::simulation::events::{
     PersonLeavesVehicleEventBuilder,
 };
 use crate::simulation::id::Id;
-use crate::simulation::messaging::messages::InternalSyncMessage;
+use crate::simulation::messaging::messages::{InternalSyncMessage, VehicleMessage};
 use crate::simulation::messaging::partition_change::{
     PartitionChangeContext, PartitionChangeEntity,
 };
@@ -132,11 +133,19 @@ impl<C: SimCommunicator> LegEngine<C> {
         agents: Vec<SimulationAgent>,
     ) -> Vec<SimulationAgent> {
         self.receive_agents(now, agents);
-        let timetable_completed = self
+        let mut timetable_completed = self
             .timetable_transit_engine
             .as_mut()
             .map(|engine| engine.do_step(now, &mut self.network_engine.network.transit_stops))
             .unwrap_or_default();
+        for vehicle in self
+            .timetable_transit_engine
+            .as_mut()
+            .map(TimetableTransitEngine::take_migrating)
+            .unwrap_or_default()
+        {
+            self.migrate_vehicle(now, vehicle);
+        }
         if let Some(transit) = &mut self.transit_engine {
             for vehicle in transit.depart_drivers(now) {
                 self.network_engine.receive_vehicle(now, vehicle, true);
@@ -175,7 +184,26 @@ impl<C: SimCommunicator> LegEngine<C> {
                     from,
                     self.clock.tick_to_time(now),
                 );
-                self.pass_to_leg_vehicle(now, veh, false);
+                if self
+                    .timetable_transit_engine
+                    .as_ref()
+                    .is_some_and(|engine| engine.drives(&veh))
+                {
+                    // A timetable vehicle follows its schedule, not the network, so it returns to
+                    // the timetable engine instead of entering the queue engine's links.
+                    timetable_completed.extend(
+                        self.timetable_transit_engine
+                            .as_mut()
+                            .unwrap()
+                            .receive_vehicle(
+                                now,
+                                veh,
+                                &mut self.network_engine.network.transit_stops,
+                            ),
+                    );
+                } else {
+                    self.pass_to_leg_vehicle(now, veh, false);
+                }
             }
 
             for mut teleportation in msg.take_teleportations() {
@@ -196,6 +224,9 @@ impl<C: SimCommunicator> LegEngine<C> {
 
         let mut agents = alighted_passengers;
         agents.extend(timetable_completed);
+        // A stop served from an arriving timetable vehicle is handled after `move_links` collected
+        // the passengers who alighted there, so this step picks up that vehicle's own alighting.
+        agents.extend(self.network_engine.network.transit_stops.take_alighted());
         for agent in self.publish_vehicular_end_events(now, network_vehicles) {
             match &mut self.transit_engine {
                 Some(transit) if agent.transit_driver().is_some() => {
@@ -222,6 +253,29 @@ impl<C: SimCommunicator> LegEngine<C> {
     #[instrument(level = "trace", skip(self), fields(rank=self.net_message_broker.rank()))]
     fn send_recv(&mut self, now: Tick) -> Vec<InternalSyncMessage> {
         self.net_message_broker.send_recv(now)
+    }
+
+    /// Hands a timetable vehicle to the partition that owns the link of its next stop, through the
+    /// same message, partition-event and migration-extension path a vehicle leaving a link takes.
+    fn migrate_vehicle(&mut self, now: Tick, vehicle: SimulationVehicle) {
+        let to = self.net_message_broker.rank_for_link(
+            vehicle
+                .curr_link_id()
+                .expect("a migrating vehicle is on the link of its next stop"),
+        );
+        let time = self.clock.tick_to_time(now);
+        emit_partition_leave_events_for_vehicle(&mut self.comp_env, &vehicle, to, time);
+        let context = PartitionChangeContext {
+            time,
+            from: self.net_message_broker.rank(),
+            to,
+        };
+        let attachments = self
+            .comp_env
+            .partition_migration_extensions_manager_borrow_mut()
+            .send(PartitionChangeEntity::Vehicle(&vehicle), &context);
+        self.net_message_broker
+            .add_veh(VehicleMessage::with_attachments(vehicle, attachments), now);
     }
 
     pub(crate) fn receive_agents(&mut self, now: Tick, agents: Vec<SimulationAgent>) {

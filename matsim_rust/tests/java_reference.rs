@@ -10,7 +10,7 @@
 
 use macros::deterministic_id_test;
 use matsim_rust::simulation::InternalAttributes;
-use matsim_rust::simulation::config::{CommandLineArgs, Config};
+use matsim_rust::simulation::config::{CommandLineArgs, Config, PartitionMethod};
 use matsim_rust::simulation::controller::controller::ControllerBuilder;
 use matsim_rust::simulation::events::utils::{read_events, read_partitioned_events};
 use matsim_rust::simulation::events::{
@@ -34,6 +34,7 @@ use matsim_rust::simulation::scenario::{Coordinate, Scenario};
 use matsim_rust::simulation::time::SimTime;
 use serde_json::{Map, Value, json};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -140,18 +141,42 @@ fn queue_execution_matches_the_pinned_reference_across_partitions() {
     assert_queue_execution_matches(2);
 }
 
+/// The number of partitions the tutorial network needs before Metis splits the train route. Its
+/// transit links form a separate component of three nodes, which a balanced cut keeps together.
+const PARTITIONS_SPLITTING_THE_TRAIN_ROUTE: u32 = 5;
+
 #[deterministic_id_test(matsim_rust)]
 fn timetable_train_and_queue_bus_match_the_pinned_reference() {
-    let config = Config::from_args(CommandLineArgs::new_with_path(
+    assert_timetable_mixed_matches(1);
+}
+
+/// The same fixture with a partitioning that splits the train's route, so every train carries
+/// passengers across a partition boundary before they alight.
+#[deterministic_id_test(matsim_rust)]
+fn timetable_train_and_queue_bus_match_the_pinned_reference_across_partitions() {
+    assert_timetable_mixed_matches(PARTITIONS_SPLITTING_THE_TRAIN_ROUTE);
+}
+
+fn assert_timetable_mixed_matches(num_parts: u32) {
+    let mut config = Config::from_args(CommandLineArgs::new_with_path(
         "./tests/resources/pt_simulated/timetable_mixed.yml",
     ));
+    config.partitioning_mut().num_parts = num_parts;
+    if num_parts > 1 {
+        // An unbalanced cut is what separates the train's stops; a balanced one keeps the transit
+        // component in one partition.
+        let PartitionMethod::Metis(options) = &mut config.partitioning_mut().method else {
+            unreachable!("the fixture partitions with Metis")
+        };
+        options.imbalance_factor = 1.0;
+    }
     let output_dir = config.output().output_dir.clone();
     let reference = read_reference("timetable_mixed");
     verify_same_conditions(&reference, &config);
 
     run(config);
 
-    let rust = normalize_partitioned_events(&output_dir.join("events"), 1);
+    let rust = normalize_partitioned_events(&output_dir.join("events"), num_parts);
     let relevant = |event: &&Value| {
         !event
             .get("person")
@@ -266,6 +291,42 @@ fn timetable_train_and_queue_bus_match_the_pinned_reference() {
     assert!(
         rust.iter()
             .any(|event| event["type"] == "stuckAndAbort" && event["person"] == "stranded-at-end")
+    );
+    if num_parts > 1 {
+        assert_timetable_train_crossed_a_partition_boundary(&output_dir, num_parts);
+    }
+}
+
+/// Proves the partitioned run moved a timetable vehicle between workers: each worker writes its own
+/// event file, so a train whose stops are spread over two files cannot have stayed on one partition.
+fn assert_timetable_train_crossed_a_partition_boundary(output_dir: &Path, num_parts: u32) {
+    let mut stop_partitions = BTreeMap::<String, u32>::new();
+    for partition in 0..num_parts {
+        let path = output_dir.join(format!("events/events.{partition}.binpb"));
+        for event in normalize_events(&path).iter().filter(|event| {
+            event["type"] == "VehicleArrivesAtFacility" && event["vehicle"] == "train-0750"
+        }) {
+            let facility = event["facility"].as_str().unwrap().to_owned();
+            assert!(
+                stop_partitions
+                    .insert(facility.clone(), partition)
+                    .is_none(),
+                "train-0750 arrived at {facility} on two partitions"
+            );
+        }
+    }
+    assert_eq!(
+        vec!["1", "2a", "3"],
+        stop_partitions
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "the run must serve every train stop, or the crossing below proves nothing"
+    );
+    assert_ne!(
+        stop_partitions["1"], stop_partitions["3"],
+        "train-0750 served its whole route on one partition, so the fixture no longer covers \
+         cross-partition timetable journeys"
     );
 }
 

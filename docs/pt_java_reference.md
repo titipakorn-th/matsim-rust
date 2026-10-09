@@ -276,6 +276,8 @@ everything, and a single global tolerance would hide exactly the differences wor
 | queue_road_* bus delay from the no-car baseline | Absolute difference no more than two seconds | The baseline and congested queue phases each contribute at most a one-second shift to the compared delay. |
 | queue_doors_* passenger events | Exact journey and event order; relative event time within one second of the stop arrival | Door handling is measured from the vehicle's stop arrival, independent of upstream link-phase differences. |
 | queue_doors_* stop dwell | Absolute difference no more than one second at each stop | Dwell is departure time minus arrival time, isolating door operations from link travel time. |
+| `timetable_mixed` train and passenger events | Absolute difference no more than one clock step | A timetable vehicle changes worker between two stops, but it arrives in time for the stop it came to serve, so the schedule still fixes the event times. |
+| `timetable_mixed` queue bus events | Absolute difference no more than two seconds | The bus stays road-driven and accumulates link and node phases. |
 | Arrival time, itineraries | Exact | The metric the routing fixture exists to compare. |
 
 supplied_plan has no event-time tolerance: the activity and leg engines exchange completed agents
@@ -399,8 +401,14 @@ sequence.
 
 The `timetable_mixed` fixture runs the supplied plans with `train` services on the SBB timetable
 engine and `pt` services on the queue network engine. Rust selects SBB-style runs with
-`transit.deterministic_service_modes`; those runs keep their event state on the single worker and
-use the scheduled stop offsets while reusing the queue engine's passenger capacity and stop queues.
-This path currently requires one partition. Cross-partition timetable service is tracked separately.
-The fixture compares train and passenger event times within one second; the queue bus's final stop
-allows two seconds for accumulated link/node phases, as the bus remains road-driven.
+`transit.deterministic_service_modes`; those runs keep their event state on whichever worker owns the
+stop being served, use the scheduled stop offsets, and reuse the queue engine's passenger capacity and
+stop queues. A timetable vehicle is handed to the worker owning its next stop before that stop is due,
+so a journey that crosses a partition boundary keeps its passengers in the vehicle while they move.
+The comparison runs with one partition and with five: the second run raises `partitioning.num_parts`
+and relaxes `imbalance_factor`, because the tutorial network's transit links form a separate
+three-node component that a balanced Metis cut keeps in one partition, and the test reads each
+worker's event file to show that the train really was served from two of them, so the multi-partition
+run cannot silently stop covering the crossing. The fixture compares train and passenger event times
+within one second; the queue bus's final stop allows two seconds for accumulated link/node phases, as
+the bus remains road-driven.
