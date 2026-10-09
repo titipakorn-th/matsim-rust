@@ -30,7 +30,9 @@ Recent upgrades extend the simulation, routing, and analysis workflow:
   transit legs are teleported by default. Transit route searches can also use per-subpopulation
   departure windows and route-choice weights through `transit.range_query_settings` and
   `transit.route_selector_settings`, plus MATSim's base, per-travel-time-hour, bounded and
-  mode-to-mode transfer penalties through `transit.transfer_penalty`.
+  mode-to-mode transfer penalties through `transit.transfer_penalty`. When vehicles are simulated,
+  experienced crowding and capacity-denied boarding affect next-iteration route costs without
+  changing vehicle capacity.
 - Activity facilities support mode-specific link selection. The controller also accepts
   custom scoring functions and replanning strategies.
 - Traffic signals use approach-link green windows. `qsim.remove_stuck_vehicles: true`
@@ -400,12 +402,12 @@ cargo run --release --bin analyze -- --run-dir /path/to/baseline --ensemble-mani
 This reads completed runs and writes `baseline/ensemble/`. The manifest format,
 compatibility checks, and statistical assumptions are documented in
 [analysis](docs/analysis.md).
-
 ## Create input files
 
-To make runs traceable, the source tree's git state is embedded at compile time and shown by
-`local_qsim --version` and at logging initialization. A `-dirty` suffix means tracked source files
-were modified at build time; `-nogit` means git metadata was unavailable.
+To make runs traceable, the source tree's git state is embedded at compile time (for example,
+`v1.0.0-12-g4f96e9b2-dirty`), shown by `local_qsim --version`, and logged when logging is initialized,
+including in per-process log files. A `-dirty` suffix means tracked source files were modified at build
+time; `-nogit` means git metadata was unavailable.
 
 The simulator accepts XML and protobuf inputs. To convert XML inputs to protobuf
 for faster loading, run:

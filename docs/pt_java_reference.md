@@ -140,6 +140,10 @@ outside its coverage.
 The fixture records MATSim's `totalRouteCost` attribute in utility units. The Rust assertion converts
 its time-equivalent cost using the pinned PT time weight before comparing the two.
 
+### `capacity_feedback`
+
+Two passengers compete for one seat on the 08:00 direct service. A second direct departure leaves at 08:30, while separate riders use the 08:05–08:20 transfer. After two iterations, the request at 08:00:01 selects the transfer in both implementations. MATSim enables SwissRailRaptor's capacity constraint; Rust uses the occupancy and failed-boarding feedback collected during the first iteration. This compares the resulting itinerary, not the internal capacity algorithms, which differ as described in [the architecture notes](architecture.md).
+
 ### `routing_mapped_modes`
 
 The same request and schedule with the `b_to_c` route changed to `bus`. Both configs enable
@@ -244,16 +248,16 @@ the same fixture assertions against the other two modes.
 
 ### `routing_person_specific_costs`
 
-This fixture exercises the reference's per-subpopulation scoring: two passengers with different
-mode utilities disagree on which service is cheapest. The schedule mirrors `routing_direct_vs_transfer`
-(a 10-min `bus` and a 50-min `rail`), and `config.yml` declares two `mode_params` blocks that share
-the `mode = "rail"` field while scoping the marginal utility to a single subpopulation. A "person"
-passenger keeps the global `rail` utility, a "freight" passenger uses the subpopulation-specific
-override, and the two requests therefore pick different services. The fixture exercises acceptance
-criterion 2 of the parent (`Params… agree with scoring of the resulting passenger modes`) at the
-subpopulation boundary rather than the global one. The Java differential reference for this fixture
-has not yet been recorded against the reference runner; the routing assertion is Rust self-consistent
-for now and will be promoted to a pinned comparison when the runner is updated.
+This fixture exercises per-subpopulation scoring: two passengers with different mode utilities
+disagree on which service is cheapest. The schedule mirrors `routing_direct_vs_transfer` (a 10-min
+`bus` and a 50-min `rail`), and the Java and Rust configs declare global and freight-specific mode
+utilities. The Java config selects SwissRailRaptor's `Individual` scoring parameters; its default
+router deliberately uses one parameter set for every passenger. `population.xml` gives the routing
+requests actual persons with their respective subpopulation attributes; a request without that
+population entry would silently route as a personless query and miss the feature under test. The
+default `person` passenger chooses rail, while the `freight` passenger chooses the bus transfer. The
+test compares both complete itineraries and arrival times against the pinned Java reference, then
+repeats the requests and changes Rust partition count to check stable choices.
 
 ## Comparison rules
 

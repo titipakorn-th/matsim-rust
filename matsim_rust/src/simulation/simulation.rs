@@ -125,6 +125,7 @@ where
     /// Performs a sim step for the activity engine and the leg engine.
     /// Leg arrivals start their next activity in the same tick; resulting legs enter the leg engine
     /// on the next exchange while keeping their original event time.
+    #[hotpath::measure]
     fn do_sim_step(&mut self, now: Tick, agents: Vec<SimulationAgent>) -> Vec<SimulationAgent> {
         let agents_act_to_leg = self.activity_engine.do_step(now, agents);
         for (event_time, agent) in self.pending_leg_agents.drain(..) {

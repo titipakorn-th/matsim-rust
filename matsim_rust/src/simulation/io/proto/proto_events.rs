@@ -718,10 +718,10 @@ pub(crate) fn try_event_from_proto(
         VehicleEntersTrafficEvent::TYPE => Box::new(VehicleEntersTrafficEvent::try_from_proto_event(proto_event, time, ids)?),
         VehicleLeavesTrafficEvent::TYPE => Box::new(VehicleLeavesTrafficEvent::try_from_proto_event(proto_event, time, ids)?),
         PersonStuckEvent::TYPE => Box::new(PersonStuckEvent::try_from_proto_event(proto_event, time, ids)?),
-        TransitDriverStartsEvent::TYPE => Box::new(TransitDriverStartsEvent::from_proto_event(proto_event, time)),
-        VehicleArrivesAtFacilityEvent::TYPE => Box::new(VehicleArrivesAtFacilityEvent::from_proto_event(proto_event, time)),
-        VehicleDepartsAtFacilityEvent::TYPE => Box::new(VehicleDepartsAtFacilityEvent::from_proto_event(proto_event, time)),
-        AgentWaitingForPtEvent::TYPE => Box::new(AgentWaitingForPtEvent::from_proto_event(proto_event, time)),
+        TransitDriverStartsEvent::TYPE => Box::new(TransitDriverStartsEvent::try_from_proto_event(proto_event, time, ids)?),
+        VehicleArrivesAtFacilityEvent::TYPE => Box::new(VehicleArrivesAtFacilityEvent::try_from_proto_event(proto_event, time, ids)?),
+        VehicleDepartsAtFacilityEvent::TYPE => Box::new(VehicleDepartsAtFacilityEvent::try_from_proto_event(proto_event, time, ids)?),
+        AgentWaitingForPtEvent::TYPE => Box::new(AgentWaitingForPtEvent::try_from_proto_event(proto_event, time, ids)?),
         _ => panic!("Unknown event type: {:?}", type_),
     };
     Some(event)
@@ -799,6 +799,64 @@ mod tests {
     }
 
     #[deterministic_id_test]
+    fn transit_events_proto_round_trip() {
+        use crate::simulation::events::{
+            AgentWaitingForPtEventBuilder, TransitDriverStartsEventBuilder,
+            VehicleArrivesAtFacilityEventBuilder, VehicleDepartsAtFacilityEventBuilder,
+        };
+        let time = SimTime::from_secs(7);
+        let events: Vec<Box<dyn EventTrait>> = vec![
+            Box::new(
+                TransitDriverStartsEventBuilder::default()
+                    .time(time)
+                    .driver(Id::create("pt_tr_1_1"))
+                    .vehicle(Id::create("tr_1"))
+                    .line(Id::create("Blue Line"))
+                    .route(Id::create("1to3"))
+                    .departure(Id::create("01"))
+                    .build()
+                    .unwrap(),
+            ),
+            Box::new(
+                VehicleArrivesAtFacilityEventBuilder::default()
+                    .time(time)
+                    .vehicle(Id::create("tr_1"))
+                    .facility(Id::create("2a"))
+                    .delay(1.5)
+                    .build()
+                    .unwrap(),
+            ),
+            Box::new(
+                VehicleDepartsAtFacilityEventBuilder::default()
+                    .time(time)
+                    .vehicle(Id::create("tr_1"))
+                    .facility(Id::create("2a"))
+                    .delay(-39.0)
+                    .build()
+                    .unwrap(),
+            ),
+            Box::new(
+                AgentWaitingForPtEventBuilder::default()
+                    .time(time)
+                    .person(Id::create("280"))
+                    .at_stop(Id::create("1"))
+                    .destination_stop(Id::create("3"))
+                    .build()
+                    .unwrap(),
+            ),
+        ];
+
+        for event in &events {
+            let proto = event_to_proto(event.as_ref());
+            assert_eq!(event.type_(), proto.r#type);
+            let parsed = event_from_proto(time, &proto);
+            // Attributes read from protobuf echo the wire attributes, so compare the
+            // canonical re-encoding instead of the structs.
+            assert_eq!(proto, event_to_proto(parsed.as_ref()));
+        }
+    }
+
+    #[deterministic_id_test]
     fn write_read_single() {
         let path =
             create_path_with_prefix("./test_output/io/proto_events/write_read_single/events.pbf");
@@ -821,7 +879,7 @@ mod tests {
         let (time, events) = reader.next().expect("Couldn't read timestep.");
         assert_eq!(SimTime::from_nanos(1_500_000), time);
         assert_eq!(1, events.len());
-        match_events(&event, events.first().unwrap());
+        match_events(event.as_ref(), events.first().unwrap());
     }
 
     #[deterministic_id_test]
@@ -874,7 +932,7 @@ mod tests {
         assert_eq!(issued_events.len(), events.len());
 
         for (i, expected_event) in issued_events.iter().enumerate() {
-            match_events(expected_event, events.get(i).unwrap());
+            match_events(expected_event.as_ref(), events.get(i).unwrap());
         }
     }
 
@@ -944,7 +1002,7 @@ mod tests {
             assert_eq!(3, events.len());
             for (i, event) in events.iter().enumerate() {
                 let index = ((time.as_secs() - start_time.as_secs()) * 3) as usize + i;
-                match_events(issued_events.get(index).unwrap(), event);
+                match_events(issued_events.get(index).unwrap().as_ref(), event);
             }
         }
     }
@@ -993,7 +1051,7 @@ mod tests {
         path_buf
     }
 
-    fn match_events(event: &Box<dyn EventTrait>, other: &GenericEvent) {
+    fn match_events(event: &dyn EventTrait, other: &GenericEvent) {
         let type_ = event.type_();
         assert_eq!(type_, other.r#type);
 

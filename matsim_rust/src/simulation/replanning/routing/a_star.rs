@@ -1,7 +1,7 @@
 use crate::simulation::id::Id;
 use crate::simulation::replanning::routing::a_star_core::{
     AStarCoreResult, AStarRequestBuilder, CandidateRoute, HeuristicMode, RoutingAStarActions,
-    a_star_core,
+    SearchBuffers, a_star_core,
 };
 use crate::simulation::replanning::routing::alt_landmark_data::AltLandmarkData;
 use crate::simulation::replanning::routing::cost::{
@@ -17,6 +17,7 @@ use crate::simulation::replanning::routing::network_converter::{
 use crate::simulation::scenario::network::{Link, Network, Node};
 use nohash_hasher::IntMap;
 use ordered_float::OrderedFloat;
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::mem::size_of;
@@ -94,14 +95,18 @@ impl AStarHeuristic for AltHeuristic {
     /// Estimate the disutility between the from- and to-node using the ALT heuristic.
     /// Uses landmarks and triangle inequality to compute a lower bound on travel disutility.
     fn estimate(&self, from: Id<Node>, to: Id<Node>) -> Disutility {
-        /* The ALT algorithm uses two lower bounds for each Landmark:
-         * given: source node S, target node T, landmark L
-         * then, due to the triangle inequality:
-         *  1) ST + TL >= SL --> ST >= SL - TL (forward estimate)
-         *  2) LS + ST >= LT --> ST >= LT - LS (backward estimate)
-         * The algorithm is interested in the largest possible value of (SL-TL) and (LT-LS),
-         * as this gives the closest approximation for the minimal travel disutility required to
-         * go from S to T.
+        /* The ALT algorithm uses two lower bounds for each landmark:
+         * given source S, target T and landmark L, the triangle inequality gives
+         *  1) SL + LT >= ST --> ST >= SL - LT
+         *  2) LT + TS >= LS --> LT >= LS - TS, and with ST >= 0 this yields nothing, so the
+         *     useful second form comes from the reverse direction:
+         *     LS + ST >= LT --> ST >= LT - LS
+         * The algorithm takes the largest of these per landmark, as that is the closest
+         * approximation to the minimal travel disutility from S to T.
+         *
+         * Both bounds pair the backward tree (disutility node -> landmark) with itself, and the
+         * forward tree with itself. Mixing the two, i.e. using SL - TL, bounds the disutility from
+         * T to S instead, which is a different quantity as soon as the network has one-way links.
          */
 
         let from_idx = self.landmark_data.node_id_to_idx()[&from];
@@ -109,14 +114,18 @@ impl AStarHeuristic for AltHeuristic {
 
         let mut h: f64 = 0.0;
         for lm_travel_disutility in self.landmark_data.travel_disutilities_to_all().iter() {
-            let from_disutility = lm_travel_disutility[from_idx]; // (SL,LS)
-            let to_disutility = lm_travel_disutility[to_idx]; // (LT,TL)
+            // (SL,LS): the first entry is the disutility from the landmark to the node (forward),
+            // the second from the node to the landmark (backward).
+            let from_disutility = lm_travel_disutility[from_idx];
+            let to_disutility = lm_travel_disutility[to_idx];
 
-            if from_disutility.0.is_finite() && to_disutility.1.is_finite() {
-                h = h.max(from_disutility.0 - to_disutility.1);
+            // d(S,L) <= d(S,T) + d(T,L), so d(S,T) >= d(S,L) - d(T,L)
+            if from_disutility.1.is_finite() && to_disutility.1.is_finite() {
+                h = h.max(from_disutility.1 - to_disutility.1);
             }
-            if to_disutility.0.is_finite() && from_disutility.1.is_finite() {
-                h = h.max(to_disutility.0 - from_disutility.1);
+            // d(L,T) <= d(L,S) + d(S,T), so d(S,T) >= d(L,T) - d(L,S)
+            if to_disutility.0.is_finite() && from_disutility.0.is_finite() {
+                h = h.max(to_disutility.0 - from_disutility.0);
             }
         }
 
@@ -124,13 +133,20 @@ impl AStarHeuristic for AltHeuristic {
 
         result
     }
-    /// The landmark bound never overestimates, but its consistency is not established here. The
-    /// maximum over landmarks of the two distance differences is admissible by the triangle
-    /// inequality, while consistency additionally needs the bound to move by at most the edge cost
-    /// along every edge of this directed graph. Candidate bounds and shared destination guidance
-    /// rely on that stronger property, because this search settles nodes without reopening them and
-    /// compares the bound against popped priorities. ALT therefore declines the capability and
-    /// those paths stay limited to heuristics that can state the property.
+    /// The landmark bound never overestimates, but it is not consistent: the maximum over
+    /// landmarks of the two distance differences can move by more than the edge cost between
+    /// neighbouring nodes. Consistency additionally needs the bound to move by at most the edge
+    /// cost along every edge of this directed graph. Candidate bounds and shared destination
+    /// guidance rely on that stronger property, because they compare the bound against popped
+    /// priorities, so ALT declines the capability and those paths stay limited to heuristics that
+    /// can state the property. See
+    /// `test_alt_heuristic_is_inconsistent_on_network_with_one_way_links`.
+    ///
+    /// The inconsistency does cost correctness in general: with nodes settled and never reopened,
+    /// an inconsistent bound may stop on a costlier route. That has not been observed on the
+    /// networks in the test suite, see
+    /// `test_alt_routes_match_dijkstra_on_network_with_one_way_links`, but it is not ruled out
+    /// either.
     fn supports_consistent_static_bounds(&self) -> bool {
         false
     }
@@ -327,7 +343,7 @@ impl<H: AStarHeuristic> AStar<H> {
         &self,
         to_link: Id<Link>,
         from_link: Id<Link>,
-        parent_links: HashMap<usize, LinkIndex>,
+        parent_links: &[Option<LinkIndex>],
     ) -> Result<Option<Vec<Id<Link>>>, GraphError> {
         // convert given "to" link id to node id, by looking for the start node of the link
         let to_node_id = self.graph.get_start_node(to_link.clone())?;
@@ -336,7 +352,7 @@ impl<H: AStarHeuristic> AStar<H> {
         let mut link_path = Vec::new();
         let mut current_node = to_node_idx;
 
-        while let Some(parent_link) = parent_links.get(&current_node).copied() {
+        while let Some(parent_link) = parent_links[current_node] {
             // while a parent link exists, add the link id to the link path
             link_path.push(self.graph.get_link_id_from_idx(parent_link)?);
             // and set the start node of that link as current node
@@ -513,6 +529,33 @@ impl<H: AStarHeuristic> AStar<H> {
 
 impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
     fn calc_least_cost_path(&self, request: LeastCostPathRequest) -> Option<LeastCostPath> {
+        // Replanning runs on long-lived rayon threads, so the search buffers outlive requests and
+        // iterations instead of being allocated in the size of the network per request. Routers of
+        // different modes share them, which is fine since `SearchBuffers::prepare` resets them and
+        // grows them as needed at the start of each search.
+        SEARCH_BUFFERS.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut buffers) => self.calc_with_buffers(request, &mut buffers),
+            // The buffers are borrowed by an outer search on this thread, e.g. if a cost function
+            // uses rayon and work stealing runs another routing task here. Fall back to fresh
+            // buffers, which costs O(N) for this search instead of panicking.
+            Err(_) => self.calc_with_buffers(request, &mut SearchBuffers::default()),
+        })
+    }
+}
+
+thread_local! {
+    /// Search buffers of all A* routers on this thread, see
+    /// [`AStar::calc_least_cost_path`].
+    static SEARCH_BUFFERS: RefCell<SearchBuffers> = RefCell::new(SearchBuffers::default());
+}
+
+impl<H: AStarHeuristic> AStar<H> {
+    /// Calculates the least cost path for the given request, using the given search buffers.
+    fn calc_with_buffers(
+        &self,
+        request: LeastCostPathRequest,
+        buffers: &mut SearchBuffers,
+    ) -> Option<LeastCostPath> {
         let route_cache_key = if *ROUTE_CACHE_ENABLED {
             self.travel_time
                 .cache_epoch()
@@ -580,6 +623,9 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
         // convert to-node id to node index
         let to_node_idx = self.graph.get_node_idx_from_id(to_node_id);
 
+        // reset the entries written by the previous search on this thread
+        buffers.prepare(self.graph.num_nodes());
+
         // create request for a_star_core
         let a_star_request = match AStarRequestBuilder::default()
             // copies from, departure time, person, vehicle values from the lcp request.
@@ -597,6 +643,7 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
                         to_node_idx,
                         self.travel_time.as_ref(),
                         self.travel_disutility.as_ref(),
+                        &mut buffers.routing,
                     ))
                     .build()
                     .unwrap()
@@ -672,6 +719,7 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
             let _entered = search_span.enter();
             a_star_core(
                 a_star_request,
+                &mut buffers.core,
                 (!search_span.is_disabled()).then_some(&mut nodes_expanded),
                 candidate,
             )
@@ -680,7 +728,7 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
         let mut candidate_bound_used = false;
         let (optimal_disutility, associated_travel_time, searched_path) = match a_star_result {
             // Standard case: A* returned a valid result.
-            Ok(AStarCoreResult::SingleDisutilWithParents(distance, time, parent_links)) => {
+            Ok(AStarCoreResult::SingleDisutil(distance, time)) => {
                 // if the returned distance to the target is infinity or NaN, it is unreachable, so
                 // we return None
                 if distance == f64::INFINITY || distance.is_nan() {
@@ -690,11 +738,12 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
                     );
                     return None;
                 }
-                // else, we take the found shortest "distance" as the optimal disutility
+                // else, we take the found shortest "distance" as the optimal disutility. The
+                // parent links are in the routing buffers.
                 let link_path = match self.extract_link_path(
                     request.to.clone(),
                     request.from.clone(),
-                    parent_links,
+                    &buffers.routing.parent_links,
                 ) {
                     Ok(Some(link_path)) => link_path,
                     Ok(None) => {
@@ -751,11 +800,17 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
 #[cfg(test)]
 mod tests {
     use crate::simulation::profiling::routing::RoutingSpanDurationToFileLayer;
+    use crate::simulation::replanning::routing::a_star_core::{
+        AStarBuffers, AStarCoreResult, AStarRequestBuilder, HeuristicMode,
+        LandmarkCalcAStarActions, a_star_core,
+    };
     use crate::simulation::replanning::routing::cost::TravelTime;
     use crate::simulation::replanning::routing::cost::{
         Disutility, FreeOrMaxSpeedTravelTimeAndDisutility, FreeSpeedTravelTimeAndDisutility,
         TravelDisutility,
     };
+    use crate::simulation::replanning::routing::graph::IndexableGraph;
+    use crate::simulation::replanning::routing::network_converter::convert_network_for_mode;
     use crate::simulation::scenario::population::InternalPerson;
 
     use crate::simulation::replanning::routing::least_cost_path_calculator::LeastCostPathCalculator;
@@ -1442,6 +1497,86 @@ mod tests {
         }
     }
 
+    /// The landmark bound must move by at most the edge cost along every edge to be consistent,
+    /// i.e. h(S,T) <= c(S,U) + h(U,T) for every edge S->U. Candidate bounds and shared destination
+    /// guidance compare the bound against popped priorities, so they rely on this holding.
+    ///
+    /// The bound is admissible but not consistent: the two forms over a landmark are lower bounds
+    /// on the shortest path, yet their maximum can jump by more than one edge cost between
+    /// neighbouring nodes. This test pins that down on a network with one-way links, so that
+    /// flipping `supports_consistent_static_bounds` to true has to revisit the exactness claim.
+    #[deterministic_id_test]
+    fn test_alt_heuristic_is_inconsistent_on_network_with_one_way_links() {
+        let network = Arc::new(Network::from_file(
+            "./assets/andorra-network.xml.gz",
+            1,
+            &PartitionMethod::Metis(MetisOptions::default()),
+        ));
+        let cost = FreeOrMaxSpeedTravelTimeAndDisutility;
+        let graph = convert_network_for_mode(network, None);
+        let heuristic = AltHeuristic::from_graph(&graph, &cost).unwrap();
+
+        let num_nodes = <dyn IndexableGraph>::num_nodes(&graph);
+        let mut checks: u64 = 0;
+        let mut violations: u64 = 0;
+        let mut worst = 0.0_f64;
+        let mut example = None;
+
+        let mut rng_state: u64 = 0x243F6A8885A308D3;
+        let mut next = move || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state % 100_000
+        };
+
+        for _ in 0..400_000 {
+            let s = next() as usize % num_nodes;
+            let t = next() as usize % num_nodes;
+            let u = next() as usize % num_nodes;
+            // edge S -> U must exist
+            let edge_cost = graph.outgoing_edges_as_idx(s).iter().find_map(|&e| {
+                if graph.get_end_node_as_idx(e).ok()? != u {
+                    return None;
+                }
+                Some(cost.travel_disutility(
+                    graph.get_link_from_idx(e).ok()?,
+                    SimTime::default(),
+                    None,
+                    None,
+                ))
+            });
+            let Some(edge_cost) = edge_cost else {
+                continue;
+            };
+            if !edge_cost.is_finite() || edge_cost < 0.0 {
+                continue;
+            }
+
+            let s_id = graph.get_node_id_from_idx(s).unwrap();
+            let t_id = graph.get_node_id_from_idx(t).unwrap();
+            let u_id = graph.get_node_id_from_idx(u).unwrap();
+
+            let h_st = heuristic.estimate(s_id.clone(), t_id.clone());
+            let h_ut = heuristic.estimate(u_id.clone(), t_id);
+            checks += 1;
+            if h_st > edge_cost + h_ut + 1e-9 {
+                violations += 1;
+                let excess = h_st - edge_cost - h_ut;
+                if excess > worst {
+                    worst = excess;
+                    example = Some((s_id, u_id, h_st, edge_cost, h_ut, excess));
+                }
+            }
+        }
+
+        assert!(checks > 0, "the sample must include at least one edge");
+        assert!(
+            violations > 0,
+            "expected an inconsistent ALT bound; checked {checks} edges, worst excess {worst:.6}, example {example:?}"
+        );
+    }
+
     #[deterministic_id_test]
     fn alt_heuristic_declines_consistent_static_bounds() {
         // Candidate bounds and shared reverse guidance rely on a consistent heuristic, which the
@@ -1657,6 +1792,118 @@ mod tests {
             let result = router.calc_least_cost_path((*request).clone());
             // In all cases, should return none
             assert!(result.is_none());
+        }
+    }
+
+    /// ALT routes must cost what Dijkstra costs, on a network with one-way links. The landmark bound
+    /// is admissible but inconsistent, and this search settles nodes without reopening them, so
+    /// this is the property that would break first if either changed. Dijkstra is the reference,
+    /// since without a heuristic it settles nothing early.
+    #[deterministic_id_test]
+    fn test_alt_routes_match_dijkstra_on_network_with_one_way_links() {
+        let network = Arc::new(Network::from_file(
+            "./assets/andorra-network.xml.gz",
+            1,
+            &PartitionMethod::Metis(MetisOptions::default()),
+        ));
+        // Deterministic pairs spread over the car links, so both routers see the same requests.
+        let car = Id::<String>::get_from_ext("car");
+        let mut links: Vec<Id<Link>> = network
+            .links()
+            .iter()
+            .filter(|l| l.modes.contains(&car))
+            .map(|l| l.id.clone())
+            .collect();
+        links.sort();
+
+        let cost = Arc::new(FreeOrMaxSpeedTravelTimeAndDisutility);
+        let alt = Alt::new(network.clone(), None, cost.clone(), cost.clone()).unwrap();
+        let dijkstra = Dijkstra::new(network, None, cost.clone(), cost).unwrap();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_003) as usize
+        };
+
+        let mut compared = 0;
+        for _ in 0..2_000 {
+            let from = links[next() % links.len()].clone();
+            let to = links[next() % links.len()].clone();
+            let request = || {
+                LeastCostPathRequestBuilder::default()
+                    .from(from.clone())
+                    .to(to.clone())
+                    .build()
+                    .unwrap()
+            };
+            let (Some(alt_path), Some(dijkstra_path)) = (
+                alt.calc_least_cost_path(request()),
+                dijkstra.calc_least_cost_path(request()),
+            ) else {
+                continue;
+            };
+            compared += 1;
+            assert!(
+                alt_path.travel_disutility <= dijkstra_path.travel_disutility + 1e-9,
+                "ALT route from {} to {} costs {} but Dijkstra costs {}",
+                from,
+                to,
+                alt_path.travel_disutility,
+                dijkstra_path.travel_disutility
+            );
+            assert_eq!(alt_path.travel_time, dijkstra_path.travel_time);
+        }
+        assert!(compared > 1_900, "expected most pairs to be reachable");
+    }
+
+    /// The ALT bound must never overestimate, on a network with one-way links. Covers every
+    /// reachable node pair, not just the triangle test network, because the bound is only
+    /// admissible when the two landmark trees are paired consistently.
+    #[deterministic_id_test]
+    fn test_alt_heuristic_is_admissible_on_network_with_one_way_links() {
+        let network = Arc::new(Network::from_file(
+            "./assets/andorra-network.xml.gz",
+            1,
+            &PartitionMethod::Metis(MetisOptions::default()),
+        ));
+        let cost = FreeOrMaxSpeedTravelTimeAndDisutility;
+        let graph = convert_network_for_mode(network, None);
+        let heuristic = AltHeuristic::from_graph(&graph, &cost).unwrap();
+
+        let num_nodes = <dyn IndexableGraph>::num_nodes(&graph);
+        for from in 0..num_nodes {
+            // Exact disutilities from `from` to every node, via Dijkstra without a heuristic.
+            let request = AStarRequestBuilder::default()
+                .graph(&graph)
+                .options(LandmarkCalcAStarActions::new(&cost))
+                .from(from)
+                .heuristic_mode(HeuristicMode::without_heuristic())
+                .build()
+                .unwrap();
+            let AStarCoreResult::DisutilityToAllWithoutParents(exact) =
+                a_star_core(request, &mut AStarBuffers::default(), None, None).unwrap()
+            else {
+                panic!("landmark run must return disutilities for all nodes")
+            };
+
+            let from_id = graph.get_node_id_from_idx(from).unwrap();
+            for to in 0..num_nodes {
+                if !exact[to].is_finite() {
+                    continue;
+                }
+                let to_id = graph.get_node_id_from_idx(to).unwrap();
+                let estimate = heuristic.estimate(from_id.clone(), to_id.clone());
+                assert!(
+                    estimate <= exact[to] + 1e-9,
+                    "ALT overestimates from {} to {}: {} > {}",
+                    from_id,
+                    to_id,
+                    estimate,
+                    exact[to]
+                );
+            }
         }
     }
 
