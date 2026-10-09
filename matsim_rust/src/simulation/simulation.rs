@@ -31,7 +31,8 @@ impl<C> Simulation<C>
 where
     C: SimCommunicator,
 {
-    #[tracing::instrument(level = "info", skip(self), fields(rank = self.leg_engine.net_message_broker().rank()))]
+    #[hotpath::measure]
+    #[tracing::instrument(level = "info", skip(self), fields(rank = self.leg_engine.net_message_broker().rank(), iteration = self.comp_env.mobsim_events_manager_borrow_mut().iteration()))]
     pub fn run(&mut self) -> Vec<SimulationAgent> {
         // use fixed start and end times
         let mut now = self.start_tick;
@@ -125,6 +126,7 @@ where
     /// Performs a sim step for the activity engine and the leg engine.
     /// Leg arrivals start their next activity in the same tick; resulting legs enter the leg engine
     /// on the next exchange while keeping their original event time.
+    #[hotpath::measure]
     fn do_sim_step(&mut self, now: Tick, agents: Vec<SimulationAgent>) -> Vec<SimulationAgent> {
         let agents_act_to_leg = self.activity_engine.do_step(now, agents);
         for (event_time, agent) in self.pending_leg_agents.drain(..) {

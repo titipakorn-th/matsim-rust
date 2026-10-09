@@ -403,6 +403,12 @@ This reads completed runs and writes `baseline/ensemble/`. The manifest format,
 compatibility checks, and statistical assumptions are documented in
 [analysis](docs/analysis.md).
 
+To make runs traceable, the git state of the source tree is embedded at compile time (e.g. `v1.0.0-12-g4f96e9b2-dirty`).
+It is printed by `local_qsim --version` and logged as the first message whenever logging is initialized, including the
+per-process log files in the output directory.
+The suffix `-dirty` means the binary was built with uncommitted changes to tracked files; `-nogit` means no git metadata
+was available at build time.
+
 ## Create input files
 
 The simulator accepts XML and protobuf inputs. To convert XML inputs to protobuf
