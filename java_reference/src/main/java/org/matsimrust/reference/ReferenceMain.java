@@ -1,5 +1,8 @@
 package org.matsimrust.reference;
 
+import ch.sbb.matsim.config.SBBTransitConfigGroup;
+import ch.sbb.matsim.mobsim.qsim.SBBTransitModule;
+import ch.sbb.matsim.mobsim.qsim.pt.SBBTransitEngineQSimModule;
 import ch.sbb.matsim.config.SwissRailRaptorConfigGroup;
 import ch.sbb.matsim.routing.pt.raptor.SwissRailRaptorModule;
 import ch.sbb.matsim.routing.pt.raptor.RaptorUtils;
@@ -73,9 +76,9 @@ public final class ReferenceMain {
     private static final Pattern EVENT_FILE = Pattern.compile("(\\d+)\\.events\\.xml(\\.gz)?");
 
     /**
-     * Event types that carry passenger meaning, with the attributes kept for each. Everything else
-     * is vehicle- or bookkeeping-level; skipped types are reported on stderr so a fixture change
-     * cannot silently drop a new observable event.
+     * Event types that carry passenger or transit-service meaning, with the attributes kept for
+     * each. Everything else is bookkeeping-level; skipped types are reported on stderr so a
+     * fixture change cannot silently drop a new observable event.
      *
      * <p>This list is derived from the pinned tree: MATSim 2026.0 emits a teleported pt leg as
      * {@code travelled} with mode {@code pt}, not as a separate event type.
@@ -87,13 +90,23 @@ public final class ReferenceMain {
         EVENT_ATTRIBUTES.put("departure", List.of("person", "legMode", "computationalRoutingMode", "link"));
         EVENT_ATTRIBUTES.put("arrival", List.of("person", "legMode", "link"));
         EVENT_ATTRIBUTES.put("travelled", List.of("person", "mode", "distance"));
+        EVENT_ATTRIBUTES.put("PersonEntersVehicle", List.of("person", "vehicle"));
+        EVENT_ATTRIBUTES.put("PersonLeavesVehicle", List.of("person", "vehicle"));
+        EVENT_ATTRIBUTES.put("PersonEntersPtVehicle", List.of("person", "vehicle"));
+        EVENT_ATTRIBUTES.put("PersonLeavesPtVehicle", List.of("person", "vehicle"));
+        EVENT_ATTRIBUTES.put("TransitDriverStarts", List.of(
+                "driverId", "vehicleId", "transitLineId", "transitRouteId", "departureId"));
+        EVENT_ATTRIBUTES.put("VehicleArrivesAtFacility", List.of("vehicle", "facility", "delay"));
+        EVENT_ATTRIBUTES.put("VehicleDepartsAtFacility", List.of("vehicle", "facility", "delay"));
+        EVENT_ATTRIBUTES.put("waitingForPt", List.of("person", "atStop", "destinationStop"));
+        EVENT_ATTRIBUTES.put("stuckAndAbort", List.of("person", "link", "legMode", "reason"));
     }
 
     /**
      * Attributes that are numbers, not identifiers. Everything else stays a string so a person or
      * link id is never read back as a number and compared numerically.
      */
-    private static final List<String> NUMERIC_ATTRIBUTES = List.of("time", "distance", "x", "y");
+    private static final List<String> NUMERIC_ATTRIBUTES = List.of("time", "distance", "x", "y", "delay");
 
     /**
      * Times are compared at millisecond resolution, which is finer than either simulation clock and
@@ -112,9 +125,13 @@ public final class ReferenceMain {
 
         Config config = ConfigUtils.loadConfig(configPath.toAbsolutePath().toString());
         boolean useSwissRailRaptor = config.getModules().containsKey(SwissRailRaptorConfigGroup.GROUP);
-        if (useSwissRailRaptor) {
-            config = ConfigUtils.loadConfig(
-                    configPath.toAbsolutePath().toString(), new SwissRailRaptorConfigGroup());
+        boolean useSbbTransit = config.getModules().containsKey(SBBTransitConfigGroup.GROUP_NAME);
+        if (useSwissRailRaptor || useSbbTransit) {
+            var groups = new ArrayList<org.matsim.core.config.ConfigGroup>();
+            if (useSwissRailRaptor) groups.add(new SwissRailRaptorConfigGroup());
+            if (useSbbTransit) groups.add(new SBBTransitConfigGroup());
+            config = ConfigUtils.loadConfig(configPath.toAbsolutePath().toString(),
+                    groups.toArray(org.matsim.core.config.ConfigGroup[]::new));
         }
         // loadScenario reads the input files named in the config; createScenario alone leaves the
         // scenario empty. `Controler` (one l) is the concrete implementation; `ControlerUtils` is
@@ -123,6 +140,11 @@ public final class ReferenceMain {
         Controler controler = new Controler(scenario);
         if (useSwissRailRaptor) {
             controler.addOverridingModule(new SwissRailRaptorModule());
+        }
+        if (useSbbTransit) {
+            controler.addOverridingModule(new SBBTransitModule());
+            controler.configureQSimComponents(components ->
+                    new SBBTransitEngineQSimModule().configure(components));
         }
         controler.run();
 
@@ -155,6 +177,7 @@ public final class ReferenceMain {
                 new String[] {"network", config.network().getInputFile()},
                 new String[] {"population", config.plans().getInputFile()},
                 new String[] {"vehicles", config.vehicles().getVehiclesFile()},
+                new String[] {"transit_vehicles", config.transit().getVehiclesFile()},
                 new String[] {"transit_schedule", config.transit().getTransitScheduleFile()})) {
             String path = input[1];
             if (path == null || path.isBlank()) {
@@ -198,9 +221,13 @@ public final class ReferenceMain {
             itinerary.put("id", request.string("id"));
             itinerary.set("request", request.node());
 
-            Person person = request.field("person") == null
+            Json personRequest = request.field("person");
+            String personId = personRequest == null
+                    ? (request.node().hasNonNull("person") ? request.string("person") : null)
+                    : personRequest.string("id");
+            Person person = personId == null
                     ? null
-                    : controler.getScenario().getPopulation().getPersons().get(Id.create(request.string("person"), Person.class));
+                    : controler.getScenario().getPopulation().getPersons().get(Id.create(personId, Person.class));
             Facility from = facility(controler.getScenario(), "probe_from_" + request.string("id"), request.field("from"));
             Facility to = facility(controler.getScenario(), "probe_to_" + request.string("id"), request.field("to"));
 
@@ -394,12 +421,15 @@ public final class ReferenceMain {
             List<Path> matches = files.filter(Files::isRegularFile)
                     .filter(path -> EVENT_FILE.matcher(path.getFileName().toString()).matches())
                     .toList();
-            if (matches.size() > 1) {
-                throw new IllegalStateException("the fixture wrote " + matches.size()
-                        + " event files; a reference records one iteration, so give it a single-iteration config");
-            }
-            return matches.isEmpty() ? null : matches.getFirst();
+            return matches.stream()
+                    .max((left, right) -> Integer.compare(iteration(left), iteration(right)))
+                    .orElse(null);
         }
+    }
+
+    private static int iteration(Path eventFile) {
+        return Integer.parseInt(EVENT_FILE.matcher(eventFile.getFileName().toString()).results()
+                .findFirst().orElseThrow().group(1));
     }
 
     /** Minimal MATSim event XML reader: one {@code <event .../>} element per line. */

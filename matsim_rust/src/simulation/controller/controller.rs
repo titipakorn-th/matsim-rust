@@ -16,6 +16,7 @@ use crate::simulation::network::LinkStorageCapacities;
 use crate::simulation::population::agent_source::{
     DynAgentSource, IntoDynAgentSource, PopulationAgentSource,
 };
+use crate::simulation::pt::feedback::{TransitSegment, TransitSegmentObservation};
 use crate::simulation::replanning::ReplanningStrategy;
 use crate::simulation::replanning::routing::a_star::{AStar, AltHeuristic};
 use crate::simulation::replanning::routing::cost::ScoringBasedTravelTimeAndDisutility;
@@ -32,6 +33,7 @@ use crate::simulation::scenario::{ControllerScenario, Scenario};
 use crate::simulation::scoring;
 use crate::simulation::scoring::{PersonExperiences, PlanScorer};
 use crate::simulation::{id, io};
+use arc_swap::ArcSwap;
 use derive_more::Debug;
 use fs_extra::dir::CopyOptions;
 use itertools::Itertools;
@@ -67,6 +69,9 @@ pub struct Controller {
     #[debug(skip)]
     replanning_strategies: Vec<Box<dyn ReplanningStrategy>>,
     person_demographics: Vec<crate::simulation::analysis::PersonDemographic>,
+    transit_capacity_feedback:
+        Arc<crate::simulation::pt::feedback::TransitCapacityFeedbackCollector>,
+    transit_capacity_snapshot: Arc<ArcSwap<BTreeMap<TransitSegment, TransitSegmentObservation>>>,
 }
 
 pub struct ControllerBuilder {
@@ -100,7 +105,37 @@ impl ControllerBuilder {
     pub fn build(mut self) -> Result<Controller, String> {
         self.scenario.config.transit().validate()?;
         self.scenario.config.travel_time_calculator().validate()?;
+        self.scenario.config.scoring().validate()?;
         let transit = self.scenario.config.transit();
+        if !transit.deterministic_service_modes.is_empty() && !transit.simulate_vehicles {
+            return Err(
+                "transit.deterministic_service_modes requires transit.simulate_vehicles: true"
+                    .to_owned(),
+            );
+        }
+        if !transit.deterministic_service_modes.is_empty()
+            && self.scenario.config.partitioning().num_parts != 1
+        {
+            return Err(
+                "transit.deterministic_service_modes currently requires one partition".to_owned(),
+            );
+        }
+        for mode in &transit.deterministic_service_modes {
+            if self.scenario.config.qsim().main_modes.contains(mode) {
+                return Err(format!(
+                    "Transit service mode {mode} cannot also be a qsim main mode"
+                ));
+            }
+            if !self.scenario.transit_schedule.lines().values().any(|line| {
+                line.routes.values().any(|route| {
+                    route.transport_mode.external() == mode && !route.departures.is_empty()
+                })
+            }) {
+                return Err(format!(
+                    "transit.deterministic_service_modes contains {mode}, but the schedule has no departures for that service mode"
+                ));
+            }
+        }
         if transit.use_mode_mapping_for_passengers
             || !transit.mode_mapping_for_passengers.is_empty()
         {
@@ -128,69 +163,17 @@ impl ControllerBuilder {
                             "transit.mode_mapping_for_passengers passengerMode {passenger_mode} must be listed in transit.transit_modes"
                         ));
                     }
-                    let Some(params) = self
+                    if !self
                         .scenario
                         .config
                         .scoring()
                         .mode_params
                         .iter()
-                        .find(|params| params.mode == *passenger_mode)
-                    else {
+                        .any(|params| params.mode == *passenger_mode)
+                    {
                         return Err(format!(
                             "transit.mode_mapping_for_passengers passengerMode {passenger_mode} needs scoring mode parameters"
                         ));
-                    };
-                    if let Some((field, _)) = [
-                        (
-                            "marginal_utility_of_traveling",
-                            params.marginal_utility_of_traveling,
-                        ),
-                        (
-                            "marginal_utility_of_distance",
-                            params.marginal_utility_of_distance,
-                        ),
-                        (
-                            "monetary_distance_cost_rate",
-                            params.monetary_distance_cost_rate,
-                        ),
-                        ("daily_money_constant", params.daily_money_constant),
-                        ("daily_utility_constant", params.daily_utility_constant),
-                        ("constant", params.constant),
-                    ]
-                    .into_iter()
-                    .find(|(_, value)| !value.is_finite())
-                    {
-                        return Err(format!(
-                            "scoring mode {passenger_mode} has a non-finite {field}"
-                        ));
-                    }
-                    let performing = self
-                        .scenario
-                        .config
-                        .scoring()
-                        .agent_params
-                        .iter()
-                        .find(|params| params.subpopulation == "person")
-                        .map_or(6.0, |params| params.performing);
-                    let pt_utility = self
-                        .scenario
-                        .config
-                        .scoring()
-                        .mode_params
-                        .iter()
-                        .find(|params| params.mode == "pt")
-                        .map_or(-6.0, |params| params.marginal_utility_of_traveling);
-                    if !performing.is_finite() || !pt_utility.is_finite() {
-                        return Err(
-                            "scoring parameters for mapped transit routing must be finite"
-                                .to_owned(),
-                        );
-                    }
-                    if performing == pt_utility {
-                        return Err(
-                            "scoring parameters for pt must produce a non-zero travel-time cost"
-                                .to_owned(),
-                        );
                     }
                 }
             }
@@ -221,6 +204,8 @@ impl ControllerBuilder {
         );
         let scenario: ControllerScenario = self.scenario.into();
         let config = scenario.core.config.clone();
+        let transit_capacity_feedback = Arc::new(Default::default());
+        let transit_capacity_snapshot = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
 
         // Without scoring, no backpacking engines are registered and no experienced plans are collected.
         let experienced_plans = if config.scoring().mode == ScoringMode::Enabled {
@@ -243,7 +228,12 @@ impl ControllerBuilder {
             Duration::from_secs(u64::from(config.travel_time_calculator().bin_size)),
             Duration::from_secs(u64::from(config.qsim().end_time)),
         ));
-        let router = Self::create_trip_router(config.as_ref(), &scenario, global_ttc.clone())?;
+        let router = Self::create_trip_router(
+            config.as_ref(),
+            &scenario,
+            global_ttc.clone(),
+            transit_capacity_snapshot.clone(),
+        )?;
 
         for i in 0..num_parts {
             let net = scenario.core.network.clone();
@@ -283,6 +273,8 @@ impl ControllerBuilder {
             scoring_function: self.scoring_function,
             replanning_strategies: self.replanning_strategies,
             person_demographics: Vec::new(),
+            transit_capacity_feedback,
+            transit_capacity_snapshot,
         })
     }
 
@@ -337,6 +329,9 @@ impl ControllerBuilder {
         config: &Config,
         controller_scenario: &ControllerScenario,
         global_ttc: Arc<GlobalTravelTimeCalculator>,
+        transit_capacity_snapshot: Arc<
+            ArcSwap<BTreeMap<TransitSegment, TransitSegmentObservation>>,
+        >,
     ) -> Result<TripRouter, String> {
         let mut routers: IntMap<Id<String>, Arc<dyn RoutingModule>> = IntMap::default();
 
@@ -402,31 +397,82 @@ impl ControllerBuilder {
                 .expect("routing config always includes walk parameters");
             let mode = Id::create("pt");
             let car_fallback = routers.get(&Id::create("car")).cloned();
-            routers.insert(
-                mode,
-                Arc::new(
-                    TransitRoutingModule::new_with_transfer_construction(
-                        controller_scenario.core.transit_schedule.clone(),
-                        walk.teleported_mode_speed,
-                        walk.beeline_distance_factor,
-                        controller_scenario.core.garage.clone(),
-                        car_fallback,
-                        config.transit().transfer_construction,
-                    )
-                    .with_personless_fallback(config.transit().personless_car_fallback)
-                    .with_passenger_mode_mapping(
-                        config.transit().use_mode_mapping_for_passengers,
-                        config.transit().mode_mapping_for_passengers.clone(),
-                        &config.scoring().mode_params,
-                        &config.scoring().agent_params,
-                    )
-                    .with_range_queries(
-                        config.transit().range_query_settings.clone(),
-                        config.transit().route_selector_settings.clone(),
-                        config.computational_setup().random_seed,
-                    ),
-                ),
-            );
+            let feeder_routers = routers.clone();
+            let mut transit_router = TransitRoutingModule::new_with_transfer_construction(
+                controller_scenario.core.transit_schedule.clone(),
+                walk.teleported_mode_speed,
+                walk.beeline_distance_factor,
+                controller_scenario.core.garage.clone(),
+                car_fallback,
+                config.transit().transfer_construction,
+            )
+            .with_capacity_feedback_snapshot(transit_capacity_snapshot)
+            .with_personless_fallback(config.transit().personless_car_fallback)
+            .with_passenger_mode_mapping(
+                config.transit().use_mode_mapping_for_passengers,
+                config.transit().mode_mapping_for_passengers.clone(),
+                &config.scoring().mode_params,
+                &config.scoring().agent_params,
+            )
+            .with_range_queries(
+                config.transit().range_query_settings.clone(),
+                config.transit().route_selector_settings.clone(),
+                config.computational_setup().random_seed,
+            )
+            .with_transfer_penalty(config.transit().transfer_penalty.clone());
+            if config.transit().use_intermodal_access_egress {
+                if config.transit().intermodal_access_egress.is_empty() {
+                    return Err("transit.use_intermodal_access_egress requires at least one transit.intermodal_access_egress entry".to_owned());
+                }
+                for setting in &config.transit().intermodal_access_egress {
+                    if setting.mode.is_empty()
+                        || !setting.initial_search_radius.is_finite()
+                        || setting.initial_search_radius <= 0.0
+                        || setting.max_radius.is_nan()
+                        || setting.max_radius < setting.initial_search_radius
+                        || !setting.search_extension_radius.is_finite()
+                        || setting.search_extension_radius <= 0.0
+                        || setting.share_trip_search_radius.is_nan()
+                        || setting.share_trip_search_radius <= 0.0
+                    {
+                        return Err(format!(
+                            "Invalid transit intermodal access/egress settings for mode '{}': search radii and share_trip_search_radius must be positive, and max_radius must be at least initial_search_radius",
+                            setting.mode
+                        ));
+                    }
+                    if !feeder_routers.contains_key(&Id::create(&setting.mode)) {
+                        return Err(format!(
+                            "No routing module found for configured transit feeder mode '{}'",
+                            setting.mode
+                        ));
+                    }
+                    if setting.person_filter_attribute.is_some()
+                        != setting.person_filter_value.is_some()
+                        || setting.stop_filter_attribute.is_some()
+                            != setting.stop_filter_value.is_some()
+                    {
+                        return Err(format!(
+                            "Transit feeder mode '{}' must configure both each filter attribute and its value",
+                            setting.mode
+                        ));
+                    }
+                }
+                let utilities = config
+                    .scoring()
+                    .mode_params
+                    .iter()
+                    .map(|params| (params.mode.clone(), params.marginal_utility_of_traveling))
+                    .collect::<BTreeMap<_, _>>();
+                transit_router = transit_router.with_intermodal_access_egress(
+                    config.transit().intermodal_access_egress.clone(),
+                    feeder_routers,
+                    utilities,
+                    config.transit().intermodal_access_egress_mode_selection,
+                    config.transit().intermodal_leg_only_handling,
+                    config.computational_setup().random_seed,
+                );
+            }
+            routers.insert(mode, Arc::new(transit_router));
         }
 
         Ok(TripRouter::new(routers))
@@ -676,10 +722,14 @@ impl Controller {
                 &self.config.output().analysis,
             );
         }
-        let inputs = self
-            .scenario
-            .split_for_mobsim(&self.link_storage_capacities);
+        let inputs = self.scenario.split_for_mobsim(
+            &self.link_storage_capacities,
+            self.transit_capacity_feedback.clone(),
+        );
         let agents = mobsim_workers.run_mobsim(iteration, is_last_iteration, inputs);
+
+        self.transit_capacity_snapshot
+            .store(Arc::new(self.transit_capacity_feedback.take()));
 
         self.controller_events_manager
             .process_event(ControllerEvent::after_mobsim(is_last_iteration));
@@ -956,10 +1006,50 @@ pub(crate) fn write_experienced_population(
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_output_directory;
-    use crate::simulation::config::OverwriteFiles;
+    use super::{ControllerBuilder, prepare_output_directory};
+    use crate::simulation::config::{CommandLineArgs, Config, OverwriteFiles, WriteEvents};
+    use crate::simulation::scenario::Scenario;
+    use macros::deterministic_id_test;
     use std::fs;
     use tempfile::tempdir;
+
+    #[deterministic_id_test]
+    fn transit_feedback_is_published_identically_across_worker_partitions() {
+        let output = tempdir().unwrap();
+        let run = |num_parts| {
+            let mut config = Config::from_args(CommandLineArgs::new_with_path(
+                "./tests/resources/pt_simulated/queue_execution.yml",
+            ));
+            config.partitioning_mut().num_parts = num_parts;
+            config.controller_mut().last_iteration = 1;
+            config.qsim_mut().end_time = 30_000;
+            config.output_mut().output_dir = output.path().join(format!("parts-{num_parts}"));
+            config.output_mut().write_events = WriteEvents::None;
+
+            let controller = ControllerBuilder::default_with_scenario(Scenario::load(config))
+                .build()
+                .unwrap();
+            let snapshot = controller.transit_capacity_snapshot.clone();
+            let _ = controller.run();
+            snapshot.load_full().as_ref().clone()
+        };
+
+        let one_partition = run(1);
+        let two_partitions = run(2);
+        assert!(
+            one_partition
+                .values()
+                .any(|observation| observation.passengers > 0 && observation.capacity > 0),
+            "no occupied transit segment feedback collected"
+        );
+        assert!(
+            one_partition
+                .values()
+                .any(|observation| observation.failed_boardings > 0),
+            "no failed boarding feedback collected"
+        );
+        assert_eq!(one_partition, two_partitions);
+    }
 
     #[test]
     fn delete_directory_if_exists_recreates_output_dir() {
