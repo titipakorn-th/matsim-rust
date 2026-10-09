@@ -2803,6 +2803,9 @@ mod route_proposal_tests {
             |boarding: SimTime, vehicle_arrival_at_board: SimTime, alighting: SimTime| Ride {
                 line: Id::create("line"),
                 route: Id::create("route"),
+                departure: Id::create("departure"),
+                board_index: 0,
+                alight_index: 1,
                 board: Id::create("ra"),
                 alight: Id::create("rc"),
                 boarding_time: boarding,
@@ -3276,12 +3279,13 @@ mod route_proposal_tests {
         let access = [(Id::create("ra"), 0.0)];
         let egress = HashSet::from([Id::create("rc")]);
         let departure = SimTime::from_secs(8 * 3600);
+        let params = router.resolve_routing_params("");
         let baseline = router
-            .find_best_path(&destination, departure, &access, &egress)
+            .find_best_path(&destination, departure, &access, &egress, &params)
             .unwrap();
         assert_eq!("direct", baseline.rides[0].route.external());
         let empty_feedback = router
-            .find_best_path(&destination, departure, &access, &egress)
+            .find_best_path(&destination, departure, &access, &egress, &params)
             .unwrap();
         assert_eq!(baseline.rides[0].route, empty_feedback.rides[0].route);
 
@@ -3307,7 +3311,7 @@ mod route_proposal_tests {
             .capacity_feedback
             .store(Arc::new(observations.take()));
         let next_iteration = router
-            .find_best_path(&destination, departure, &access, &egress)
+            .find_best_path(&destination, departure, &access, &egress, &params)
             .unwrap();
         assert_eq!(
             vec!["a_to_b", "b_to_c"],
@@ -3318,7 +3322,7 @@ mod route_proposal_tests {
                 .collect::<Vec<_>>()
         );
         let repeated = router
-            .find_best_path(&destination, departure, &access, &egress)
+            .find_best_path(&destination, departure, &access, &egress, &params)
             .unwrap();
         assert_eq!(
             next_iteration
@@ -3367,8 +3371,10 @@ mod route_proposal_tests {
             board: Id::create("ra"),
             alight: Id::create("rc"),
             boarding_time: SimTime::from_secs(8 * 3600),
+            vehicle_arrival_at_board: SimTime::from_secs(8 * 3600),
             alighting_time: SimTime::from_secs(8 * 3600 + 50 * 60),
             distance: 0.0,
+            transport_mode: "bus".to_string(),
             passenger_mode: "pt".to_string(),
             transfer_before: None,
         };
