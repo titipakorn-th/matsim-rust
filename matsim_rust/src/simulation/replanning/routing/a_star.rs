@@ -95,14 +95,18 @@ impl AStarHeuristic for AltHeuristic {
     /// Estimate the disutility between the from- and to-node using the ALT heuristic.
     /// Uses landmarks and triangle inequality to compute a lower bound on travel disutility.
     fn estimate(&self, from: Id<Node>, to: Id<Node>) -> Disutility {
-        /* The ALT algorithm uses two lower bounds for each Landmark:
-         * given: source node S, target node T, landmark L
-         * then, due to the triangle inequality:
-         *  1) ST + TL >= SL --> ST >= SL - TL (forward estimate)
-         *  2) LS + ST >= LT --> ST >= LT - LS (backward estimate)
-         * The algorithm is interested in the largest possible value of (SL-TL) and (LT-LS),
-         * as this gives the closest approximation for the minimal travel disutility required to
-         * go from S to T.
+        /* The ALT algorithm uses two lower bounds for each landmark:
+         * given source S, target T and landmark L, the triangle inequality gives
+         *  1) SL + LT >= ST --> ST >= SL - LT
+         *  2) LT + TS >= LS --> LT >= LS - TS, and with ST >= 0 this yields nothing, so the
+         *     useful second form comes from the reverse direction:
+         *     LS + ST >= LT --> ST >= LT - LS
+         * The algorithm takes the largest of these per landmark, as that is the closest
+         * approximation to the minimal travel disutility from S to T.
+         *
+         * Both bounds pair the backward tree (disutility node -> landmark) with itself, and the
+         * forward tree with itself. Mixing the two, i.e. using SL - TL, bounds the disutility from
+         * T to S instead, which is a different quantity as soon as the network has one-way links.
          */
 
         let from_idx = self.landmark_data.node_id_to_idx()[&from];
@@ -110,14 +114,18 @@ impl AStarHeuristic for AltHeuristic {
 
         let mut h: f64 = 0.0;
         for lm_travel_disutility in self.landmark_data.travel_disutilities_to_all().iter() {
-            let from_disutility = lm_travel_disutility[from_idx]; // (SL,LS)
-            let to_disutility = lm_travel_disutility[to_idx]; // (LT,TL)
+            // (SL,LS): the first entry is the disutility from the landmark to the node (forward),
+            // the second from the node to the landmark (backward).
+            let from_disutility = lm_travel_disutility[from_idx];
+            let to_disutility = lm_travel_disutility[to_idx];
 
-            if from_disutility.0.is_finite() && to_disutility.1.is_finite() {
-                h = h.max(from_disutility.0 - to_disutility.1);
+            // d(S,L) <= d(S,T) + d(T,L), so d(S,T) >= d(S,L) - d(T,L)
+            if from_disutility.1.is_finite() && to_disutility.1.is_finite() {
+                h = h.max(from_disutility.1 - to_disutility.1);
             }
-            if to_disutility.0.is_finite() && from_disutility.1.is_finite() {
-                h = h.max(to_disutility.0 - from_disutility.1);
+            // d(L,T) <= d(L,S) + d(S,T), so d(S,T) >= d(L,T) - d(L,S)
+            if to_disutility.0.is_finite() && from_disutility.0.is_finite() {
+                h = h.max(to_disutility.0 - from_disutility.0);
             }
         }
 
@@ -785,11 +793,17 @@ impl<H: AStarHeuristic> AStar<H> {
 #[cfg(test)]
 mod tests {
     use crate::simulation::profiling::routing::RoutingSpanDurationToFileLayer;
+    use crate::simulation::replanning::routing::a_star_core::{
+        AStarBuffers, AStarCoreResult, AStarRequestBuilder, HeuristicMode,
+        LandmarkCalcAStarActions, a_star_core,
+    };
     use crate::simulation::replanning::routing::cost::TravelTime;
     use crate::simulation::replanning::routing::cost::{
         Disutility, FreeOrMaxSpeedTravelTimeAndDisutility, FreeSpeedTravelTimeAndDisutility,
         TravelDisutility,
     };
+    use crate::simulation::replanning::routing::graph::IndexableGraph;
+    use crate::simulation::replanning::routing::network_converter::convert_network_for_mode;
     use crate::simulation::scenario::population::InternalPerson;
 
     use crate::simulation::replanning::routing::least_cost_path_calculator::LeastCostPathCalculator;
@@ -1691,6 +1705,55 @@ mod tests {
             let result = router.calc_least_cost_path((*request).clone());
             // In all cases, should return none
             assert!(result.is_none());
+        }
+    }
+
+    /// The ALT bound must never overestimate, on a network with one-way links. Covers every
+    /// reachable node pair, not just the triangle test network, because the bound is only
+    /// admissible when the two landmark trees are paired consistently.
+    #[deterministic_id_test]
+    fn test_alt_heuristic_is_admissible_on_network_with_one_way_links() {
+        let network = Arc::new(Network::from_file(
+            "./assets/andorra-network.xml.gz",
+            1,
+            &PartitionMethod::Metis(MetisOptions::default()),
+        ));
+        let cost = FreeOrMaxSpeedTravelTimeAndDisutility;
+        let graph = convert_network_for_mode(network, None);
+        let heuristic = AltHeuristic::from_graph(&graph, &cost).unwrap();
+
+        let num_nodes = <dyn IndexableGraph>::num_nodes(&graph);
+        for from in 0..num_nodes {
+            // Exact disutilities from `from` to every node, via Dijkstra without a heuristic.
+            let request = AStarRequestBuilder::default()
+                .graph(&graph)
+                .options(LandmarkCalcAStarActions::new(&cost))
+                .from(from)
+                .heuristic_mode(HeuristicMode::without_heuristic())
+                .build()
+                .unwrap();
+            let AStarCoreResult::DisutilityToAllWithoutParents(exact) =
+                a_star_core(request, &mut AStarBuffers::default(), None, None).unwrap()
+            else {
+                panic!("landmark run must return disutilities for all nodes")
+            };
+
+            let from_id = graph.get_node_id_from_idx(from).unwrap();
+            for to in 0..num_nodes {
+                if !exact[to].is_finite() {
+                    continue;
+                }
+                let to_id = graph.get_node_id_from_idx(to).unwrap();
+                let estimate = heuristic.estimate(from_id.clone(), to_id.clone());
+                assert!(
+                    estimate <= exact[to] + 1e-9,
+                    "ALT overestimates from {} to {}: {} > {}",
+                    from_id,
+                    to_id,
+                    estimate,
+                    exact[to]
+                );
+            }
         }
     }
 
