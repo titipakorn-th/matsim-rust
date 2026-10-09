@@ -1006,10 +1006,50 @@ pub(crate) fn write_experienced_population(
 
 #[cfg(test)]
 mod tests {
-    use super::prepare_output_directory;
-    use crate::simulation::config::OverwriteFiles;
+    use super::{ControllerBuilder, prepare_output_directory};
+    use crate::simulation::config::{CommandLineArgs, Config, OverwriteFiles, WriteEvents};
+    use crate::simulation::scenario::Scenario;
+    use macros::deterministic_id_test;
     use std::fs;
     use tempfile::tempdir;
+
+    #[deterministic_id_test]
+    fn transit_feedback_is_published_identically_across_worker_partitions() {
+        let output = tempdir().unwrap();
+        let run = |num_parts| {
+            let mut config = Config::from_args(CommandLineArgs::new_with_path(
+                "./tests/resources/pt_simulated/queue_execution.yml",
+            ));
+            config.partitioning_mut().num_parts = num_parts;
+            config.controller_mut().last_iteration = 1;
+            config.qsim_mut().end_time = 30_000;
+            config.output_mut().output_dir = output.path().join(format!("parts-{num_parts}"));
+            config.output_mut().write_events = WriteEvents::None;
+
+            let controller = ControllerBuilder::default_with_scenario(Scenario::load(config))
+                .build()
+                .unwrap();
+            let snapshot = controller.transit_capacity_snapshot.clone();
+            let _ = controller.run();
+            snapshot.load_full().as_ref().clone()
+        };
+
+        let one_partition = run(1);
+        let two_partitions = run(2);
+        assert!(
+            one_partition
+                .values()
+                .any(|observation| observation.passengers > 0 && observation.capacity > 0),
+            "no occupied transit segment feedback collected"
+        );
+        assert!(
+            one_partition
+                .values()
+                .any(|observation| observation.failed_boardings > 0),
+            "no failed boarding feedback collected"
+        );
+        assert_eq!(one_partition, two_partitions);
+    }
 
     #[test]
     fn delete_directory_if_exists_recreates_output_dir() {

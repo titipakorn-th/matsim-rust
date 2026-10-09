@@ -813,6 +813,40 @@ fn a_faster_shared_stop_transfer_beats_a_direct_service() {
     );
 }
 
+/// A full first departure changes the next iteration's route on both implementations.
+#[deterministic_id_test(matsim_rust)]
+fn previous_iteration_crowding_changes_the_pinned_reference_itinerary() {
+    let request = load_request("capacity_feedback");
+    let config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/capacity_feedback/config.yml",
+    ));
+    let reference = read_reference("capacity_feedback");
+    verify_same_conditions(&reference, &config);
+    let router = run(config);
+    let rust = calc_pt_route(&request, &router, None);
+    let expected = reference
+        .itineraries
+        .iter()
+        .find(|itinerary| itinerary["id"] == request["id"])
+        .expect("the crowded routing request is recorded in the reference");
+
+    let transfer = vec![
+        ride("a_to_b", "ra", "rb", 29100.0),
+        ride("b_to_c", "rb", "rc", 30000.0),
+    ];
+    assert_eq!(
+        rides(expected),
+        transfer,
+        "MATSim no longer avoids the full service"
+    );
+    assert_eq!(
+        rides(&rust),
+        transfer,
+        "Rust no longer avoids the full service"
+    );
+    assert_eq!(arrival_time(&rust), arrival_time(expected));
+}
+
 /// With no PT ride between the endpoints, `avoid` returns the cheapest feeder-only itinerary.
 #[deterministic_id_test(matsim_rust)]
 fn intermodal_feeder_only_routes_match_the_pinned_reference() {

@@ -405,12 +405,15 @@ public final class ReferenceMain {
             List<Path> matches = files.filter(Files::isRegularFile)
                     .filter(path -> EVENT_FILE.matcher(path.getFileName().toString()).matches())
                     .toList();
-            if (matches.size() > 1) {
-                throw new IllegalStateException("the fixture wrote " + matches.size()
-                        + " event files; a reference records one iteration, so give it a single-iteration config");
-            }
-            return matches.isEmpty() ? null : matches.getFirst();
+            return matches.stream()
+                    .max((left, right) -> Integer.compare(iteration(left), iteration(right)))
+                    .orElse(null);
         }
+    }
+
+    private static int iteration(Path eventFile) {
+        return Integer.parseInt(EVENT_FILE.matcher(eventFile.getFileName().toString()).results()
+                .findFirst().orElseThrow().group(1));
     }
 
     /** Minimal MATSim event XML reader: one {@code <event .../>} element per line. */

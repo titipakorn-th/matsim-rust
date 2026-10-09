@@ -1677,19 +1677,22 @@ impl TransitRoutingModule {
             return 0.0;
         }
 
-        let ride_seconds = ride
-            .alighting_time
-            .duration_since(ride.boarding_time)
-            .as_secs_f64();
-        let segment_seconds = ride_seconds / (to - from) as f64;
         let mut penalty = 0.0;
         for index in from..to {
+            let from_stop = &route.stops[index];
+            let to_stop = &route.stops[index + 1];
+            let segment_seconds = to_stop
+                .arrival_offset
+                .or(to_stop.departure_offset)
+                .unwrap_or_default()
+                .saturating_sub(from_stop.departure_offset.unwrap_or_default())
+                .as_secs_f64();
             let segment = TransitSegment {
                 line: ride.line.clone(),
                 route: ride.route.clone(),
                 departure: ride.departure.clone(),
-                from: route.stops[index].facility_id.clone(),
-                to: route.stops[index + 1].facility_id.clone(),
+                from: from_stop.facility_id.clone(),
+                to: to_stop.facility_id.clone(),
             };
             let Some(observation) = feedback.get(&segment) else {
                 continue;
@@ -1698,7 +1701,10 @@ impl TransitRoutingModule {
                 let occupancy = observation.passengers as f64 / observation.capacity as f64;
                 penalty += segment_seconds * occupancy;
             }
-            if index == from && observation.failed_boardings + observation.boarded > 0 {
+            let boarding_attempts = observation
+                .failed_boardings
+                .saturating_add(observation.boarded);
+            if index == from && boarding_attempts > 0 {
                 let boarding_offset = route.stops[from].departure_offset.unwrap_or_default();
                 let headway = route
                     .departures
@@ -1711,8 +1717,7 @@ impl TransitRoutingModule {
                     .map(|departure| departure.duration_since(ride.boarding_time).as_secs_f64())
                     .min_by(f64::total_cmp)
                     .unwrap_or(0.0);
-                penalty += headway * observation.failed_boardings as f64
-                    / (observation.failed_boardings + observation.boarded) as f64;
+                penalty += headway * observation.failed_boardings as f64 / boarding_attempts as f64;
             }
         }
         penalty
@@ -2379,7 +2384,7 @@ mod tests {
 #[cfg(test)]
 mod route_proposal_tests {
     use super::{
-        Facility, OWNS_CAR, RouteFrequencyProposalBackend, RouteProposal, RouteProposalKey,
+        Facility, OWNS_CAR, Ride, RouteFrequencyProposalBackend, RouteProposal, RouteProposalKey,
         RouteProposalSeed, RouteProposalTable, RoutingError, RoutingModule, RoutingRequest,
         RoutingRequestBuilder, TransitRoutingModule, TransitSegment, TransitSegmentObservation,
         TransitSkimOutcome, TripRouter, matching_transit_settings, transit_path_tiebreak,
@@ -2398,7 +2403,7 @@ mod route_proposal_tests {
         InternalPlanElement, InternalRoute, Population,
     };
     use crate::simulation::scenario::transit::{
-        TransitDeparture, TransitLine, TransitRoute, TransitSchedule,
+        TransitDeparture, TransitLine, TransitRoute, TransitRouteStop, TransitSchedule,
     };
     use crate::simulation::scenario::vehicles::{Garage, InternalVehicle};
     use crate::simulation::time::SimTime;
@@ -2762,6 +2767,65 @@ mod route_proposal_tests {
                 .iter()
                 .map(|ride| ride.route.external())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[deterministic_id_test]
+    fn occupancy_penalty_uses_each_scheduled_segment_duration() {
+        let mut schedule = reference_schedule();
+        schedule
+            .lines_mut()
+            .get_mut(&Id::<TransitLine>::create("Reference Line"))
+            .unwrap()
+            .routes
+            .get_mut(&Id::<TransitRoute>::create("direct"))
+            .unwrap()
+            .stops
+            .insert(
+                1,
+                TransitRouteStop {
+                    facility_id: Id::create("rb"),
+                    arrival_offset: Some(Duration::from_secs(5 * 60)),
+                    departure_offset: Some(Duration::from_secs(10 * 60)),
+                    await_departure: None,
+                    allow_boarding: true,
+                    allow_alighting: true,
+                    minimum_stop_duration: Duration::ZERO,
+                },
+            );
+        let router = reference_router(schedule, 0.8333333333333334);
+        let ride = Ride {
+            line: Id::create("Reference Line"),
+            route: Id::create("direct"),
+            departure: Id::create("d_0800"),
+            board_index: 0,
+            alight_index: 2,
+            board: Id::create("ra"),
+            alight: Id::create("rc"),
+            boarding_time: SimTime::from_secs(8 * 3600),
+            alighting_time: SimTime::from_secs(8 * 3600 + 50 * 60),
+            distance: 0.0,
+            passenger_mode: "pt".to_string(),
+            transfer_before: None,
+        };
+        let crowded_first_segment = BTreeMap::from([(
+            TransitSegment {
+                line: Id::create("Reference Line"),
+                route: Id::create("direct"),
+                departure: Id::create("d_0800"),
+                from: Id::create("ra"),
+                to: Id::create("rb"),
+            },
+            TransitSegmentObservation {
+                passengers: 1,
+                capacity: 1,
+                ..TransitSegmentObservation::default()
+            },
+        )]);
+
+        assert_eq!(
+            5.0 * 60.0,
+            router.capacity_feedback_cost_seconds(&ride, &crowded_first_segment)
         );
     }
 
