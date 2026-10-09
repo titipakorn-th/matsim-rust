@@ -1920,6 +1920,8 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
     let config = Config::from_args(CommandLineArgs::new_with_path(
         "./tests/resources/pt_reference/routing_person_specific_costs/config.yml",
     ));
+    let reference = read_reference("routing_person_specific_costs");
+    verify_same_conditions(&reference, &config);
     let router = run(config);
 
     let person_request = load_request_at("routing_person_specific_costs", 0);
@@ -1941,6 +1943,15 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
     let freight = internal_person(&freight_request);
     let person_route = calc_pt_route(&person_request, &router, Some(&person));
     let freight_route = calc_pt_route(&freight_request, &router, Some(&freight));
+    let reference_itinerary = |id: &str| {
+        reference
+            .itineraries
+            .iter()
+            .find(|itinerary| itinerary["id"] == id)
+            .unwrap_or_else(|| panic!("the reference is missing request {id}"))
+    };
+    let person_reference = reference_itinerary("person_prefers_rail");
+    let freight_reference = reference_itinerary("freight_prefers_bus");
 
     // The person subpopulation prefers rail: the single-ride direct service beats the bus
     // transfer by cost. The freight subpopulation inverts those utilities and prefers the bus
@@ -1959,6 +1970,35 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
         "the freight subpopulation inverts the per-mode utility and picks the bus transfer"
     );
     assert_ne!(rides(&person_route), rides(&freight_route));
+    assert_eq!(rides(person_reference), rides(&person_route));
+    assert_eq!(rides(freight_reference), rides(&freight_route));
+    assert_eq!(arrival_time(person_reference), arrival_time(&person_route));
+    assert_eq!(
+        arrival_time(freight_reference),
+        arrival_time(&freight_route)
+    );
+
+    assert_eq!(
+        calc_pt_route(&person_request, &router, Some(&person)),
+        person_route,
+        "repeating the same request should preserve its unique optimum"
+    );
+    let mut partitioned_config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/routing_person_specific_costs/config.yml",
+    ));
+    partitioned_config.partitioning_mut().num_parts = 2;
+    partitioned_config.output_mut().output_dir.push("two_parts");
+    let partitioned_router = run(partitioned_config);
+    assert_eq!(
+        calc_pt_route(&person_request, &partitioned_router, Some(&person)),
+        person_route,
+        "partition changes should preserve the default passenger's unique optimum"
+    );
+    assert_eq!(
+        calc_pt_route(&freight_request, &partitioned_router, Some(&freight)),
+        freight_route,
+        "partition changes should preserve the freight passenger's unique optimum"
+    );
 }
 
 /// The range profile includes both inclusive window boundaries and never repeats yesterday's
