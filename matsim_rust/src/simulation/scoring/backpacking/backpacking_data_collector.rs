@@ -193,20 +193,21 @@ impl BackpackingDataCollector {
         }
     }
 
-    /// The persons a migrating entity carries backpacks for. A transit driver is a synthetic agent
-    /// that never has one: scoring and the event handlers skip it the same way.
     fn person_ids(&self, entity: PartitionChangeEntity<'_>) -> Vec<Id<InternalPerson>> {
-        let persons = match entity {
+        match entity {
             PartitionChangeEntity::Vehicle(vehicle) => std::iter::once(vehicle.driver().id())
                 .chain(vehicle.passengers().iter().map(Identifiable::id))
+                .filter(|person| !self.transit_runs.is_driver(person))
                 .cloned()
                 .collect(),
-            PartitionChangeEntity::TeleportationAgent(agent) => vec![agent.id().clone()],
-        };
-        persons
-            .into_iter()
-            .filter(|person| !self.transit_runs.is_driver(person))
-            .collect()
+            PartitionChangeEntity::TeleportationAgent(agent) => {
+                if self.transit_runs.is_driver(agent.id()) {
+                    Vec::new()
+                } else {
+                    vec![agent.id().clone()]
+                }
+            }
+        }
     }
 
     pub(crate) fn finish(&mut self) -> IntMap<Id<InternalPerson>, PersonExperience> {

@@ -1,3 +1,4 @@
+use crate::simulation::build_info::GIT_VERSION;
 use crate::simulation::config::VertexWeight::InLinkCapacity;
 use crate::simulation::io::is_url;
 use crate::simulation::replanning::{KEEP_LAST_SELECTED_STRATEGY_NAME, WORST_SCORE_STRATEGY_NAME};
@@ -40,7 +41,7 @@ struct OverrideHandler {
 inventory::collect!(OverrideHandler);
 
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = GIT_VERSION, about, long_about = None)]
 pub struct CommandLineArgs {
     #[arg(long, short)]
     pub config: String,
@@ -560,6 +561,9 @@ pub struct Transit {
     /// Transit route modes driven by the timetable engine rather than the queue network engine.
     #[serde(default)]
     pub deterministic_service_modes: Vec<String>,
+    /// Emit synthetic link and traffic events for timetable-driven vehicles every N iterations; 0 disables them.
+    #[serde(default)]
+    pub create_link_events_interval: u32,
     /// Use service-to-passenger mode mappings for transit routing, scoring, and returned ride legs.
     #[serde(default)]
     pub use_mode_mapping_for_passengers: bool,
@@ -753,6 +757,7 @@ impl Default for Transit {
             simulate_vehicles: false,
             transit_modes: default_transit_modes(),
             deterministic_service_modes: Vec::new(),
+            create_link_events_interval: 0,
             use_mode_mapping_for_passengers: false,
             mode_mapping_for_passengers: BTreeMap::new(),
             personless_car_fallback: false,
@@ -957,6 +962,10 @@ register_override!("transit.deterministic_service_modes", |config, value| {
         .filter(|mode| !mode.is_empty())
         .map(ToString::to_string)
         .collect();
+});
+
+register_override!("transit.create_link_events_interval", |config, value| {
+    config.transit_mut().create_link_events_interval = value.parse().unwrap();
 });
 
 register_override!(
@@ -1572,6 +1581,7 @@ impl Default for Replanning {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Scoring {
+    pub mode: ScoringMode,
     pub write_experienced_plans: bool,
     pub activity_params: Vec<ActivityParameter>,
     pub mode_params: Vec<ModeParameter>,
@@ -1581,6 +1591,14 @@ pub struct Scoring {
 register_override!("scoring.write_experienced_plans", |config, value| {
     config.scoring_mut().write_experienced_plans = value.parse().unwrap();
 });
+
+/// `Disabled` skips backpacking and scoring entirely. Selected plans then receive no score.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+pub enum ScoringMode {
+    #[default]
+    Enabled,
+    Disabled,
+}
 
 impl Scoring {
     /// Reject parameter values that the routing logic cannot turn into a finite travel-time cost.
@@ -1663,6 +1681,7 @@ impl Scoring {
 impl Default for Scoring {
     fn default() -> Self {
         Self {
+            mode: ScoringMode::Enabled,
             write_experienced_plans: true,
             activity_params: vec![
                 ActivityParameter::default_for_activity_type("home"),
@@ -1682,6 +1701,14 @@ impl Default for Scoring {
         }
     }
 }
+
+register_override!("scoring.mode", |config, value| {
+    config.scoring_mut().mode = match value.to_lowercase().as_str() {
+        "enabled" => ScoringMode::Enabled,
+        "disabled" => ScoringMode::Disabled,
+        _ => panic!("Invalid scoring mode: {}", value),
+    };
+});
 
 register_override!("scoring.write_experienced_plans", |config, value| {
     config.scoring_mut().write_experienced_plans = value.parse().unwrap();
@@ -2483,8 +2510,8 @@ mod tests {
     use crate::simulation::config::{
         ActivityParameter, AgentParameter, CommandLineArgs, CompressionType, ComputationalSetup,
         Config, Controller, EdgeWeight, MetisOptions, ModeParameter, PartitionMethod, Partitioning,
-        QSim, Replanning, Routing, Scoring, SignalFilesConfig, StrategySetting, TeleportedParams,
-        TravelTimeCalculator, VertexWeight, parse_key_val,
+        QSim, Replanning, Routing, Scoring, ScoringMode, SignalFilesConfig, StrategySetting,
+        TeleportedParams, TravelTimeCalculator, VertexWeight, parse_key_val,
     };
     use crate::simulation::config::{
         Ids, Network, Population, Transit, TransitModeToModeTransferPenalty,
@@ -2874,6 +2901,7 @@ mod tests {
         modules:
           scoring:
             type: Scoring
+            mode: Disabled
             write_experienced_plans: true
             activity_params:
               - activity_type: home
@@ -2898,6 +2926,7 @@ mod tests {
 
         let config: Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         let expected = Scoring {
+            mode: ScoringMode::Disabled,
             write_experienced_plans: true,
             activity_params: vec![ActivityParameter {
                 activity_type: "home".to_string(),
@@ -3210,11 +3239,13 @@ modules:
     type: Transit
     schedule_path: schedule.xml
     deterministic_service_modes: [train]
+    create_link_events_interval: 3
 "#;
         let parsed: Config = serde_yaml::from_str(yaml).expect("failed to parse config");
         assert!(!parsed.transit().simulate_vehicles);
         assert_eq!(vec!["pt"], parsed.transit().transit_modes);
         assert_eq!(vec!["train"], parsed.transit().deterministic_service_modes);
+        assert_eq!(3, parsed.transit().create_link_events_interval);
 
         let file = write_temp_config(yaml);
         let config = Config::from_args(CommandLineArgs {
@@ -3226,11 +3257,16 @@ modules:
                     "transit.deterministic_service_modes".to_string(),
                     "train".to_string(),
                 ),
+                (
+                    "transit.create_link_events_interval".to_string(),
+                    "5".to_string(),
+                ),
             ],
         });
         assert!(config.transit().simulate_vehicles);
         assert_eq!(vec!["bus", "rail"], config.transit().transit_modes);
         assert_eq!(vec!["train"], config.transit().deterministic_service_modes);
+        assert_eq!(5, config.transit().create_link_events_interval);
     }
 
     #[test]
@@ -3637,6 +3673,16 @@ modules:
         )]);
 
         assert!(!config.scoring().write_experienced_plans);
+    }
+
+    #[test]
+    fn override_scoring_mode() {
+        let mut config = base_config();
+        assert_eq!(config.scoring().mode, ScoringMode::Enabled);
+
+        config.apply_overrides(&[("scoring.mode".to_string(), "disabled".to_string())]);
+
+        assert_eq!(config.scoring().mode, ScoringMode::Disabled);
     }
 
     #[test]

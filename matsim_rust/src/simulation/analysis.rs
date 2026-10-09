@@ -38,7 +38,7 @@ use crate::simulation::events::{
 use crate::simulation::id;
 use crate::simulation::id::Id;
 use crate::simulation::io::proto::proto_events::{ProtoEventsReader, event_from_proto};
-use crate::simulation::io::xml::events::{TimedEvent, XmlEventsReader};
+use crate::simulation::io::xml::events::{self as xml_events, TimedEvent, XmlEventsReader};
 use crate::simulation::scenario::network::{Link, Network, Node};
 use crate::simulation::scenario::population::{InternalPlanElement, Population};
 use crate::simulation::scenario::transit::TransitSchedule;
@@ -3179,7 +3179,7 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), AnalysisError> 
 enum PartitionReader {
     Xml(Box<XmlEventsReader>),
     Proto {
-        reader: ProtoEventsReader<File>,
+        reader: ProtoEventsReader,
         pending: Option<(
             SimTime,
             std::vec::IntoIter<crate::generated::events::GenericEvent>,
@@ -3199,10 +3199,16 @@ impl PartitionReader {
                 {
                     return Ok(Some((*time, event_from_proto(*time, &event))));
                 }
-                let Some((time, events)) = reader.try_next().map_err(|error| {
-                    AnalysisError(format!("failed to parse protobuf events: {error}"))
-                })?
-                else {
+                // The reader panics on undecodable input. Catch it, so that a broken event file
+                // becomes a module diagnostic instead of aborting the report.
+                let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.next()))
+                    .map_err(|panic| {
+                        AnalysisError(format!(
+                            "failed to parse protobuf events: {}",
+                            xml_events::panic_message(panic)
+                        ))
+                    })?;
+                let Some((time, events)) = next else {
                     return Ok(None);
                 };
                 *pending = Some((time, events.into_iter()));

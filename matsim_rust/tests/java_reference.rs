@@ -8,16 +8,20 @@
 //! test suite uses: the controller writes the events, and the router the controller built answers
 //! routing requests.
 
+mod common;
+
 use macros::deterministic_id_test;
 use matsim_rust::simulation::InternalAttributes;
-use matsim_rust::simulation::config::{CommandLineArgs, Config, PartitionMethod};
+use matsim_rust::simulation::config::{CommandLineArgs, Config};
 use matsim_rust::simulation::controller::controller::ControllerBuilder;
 use matsim_rust::simulation::events::utils::{read_events, read_partitioned_events};
 use matsim_rust::simulation::events::{
     ActivityEndEvent, ActivityStartEvent, AgentWaitingForPtEvent, EventTrait, EventsManager,
-    PersonArrivalEvent, PersonDepartureEvent, PersonEntersVehicleEvent, PersonLeavesVehicleEvent,
-    PersonStuckEvent, PtTeleportationArrivalEvent, TeleportationArrivalEvent,
-    TransitDriverStartsEvent, VehicleArrivesAtFacilityEvent, VehicleDepartsAtFacilityEvent,
+    LinkEnterEvent, LinkLeaveEvent, PersonArrivalEvent, PersonDepartureEvent,
+    PersonEntersVehicleEvent, PersonLeavesVehicleEvent, PersonStuckEvent,
+    PtTeleportationArrivalEvent, TeleportationArrivalEvent, TransitDriverStartsEvent,
+    VehicleArrivesAtFacilityEvent, VehicleDepartsAtFacilityEvent, VehicleEntersTrafficEvent,
+    VehicleLeavesTrafficEvent,
 };
 use matsim_rust::simulation::id::Id;
 use matsim_rust::simulation::replanning::routing::{
@@ -34,7 +38,6 @@ use matsim_rust::simulation::scenario::{Coordinate, Scenario};
 use matsim_rust::simulation::time::SimTime;
 use serde_json::{Map, Value, json};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -141,40 +144,37 @@ fn queue_execution_matches_the_pinned_reference_across_partitions() {
     assert_queue_execution_matches(2);
 }
 
-/// The number of partitions the tutorial network needs before Metis splits the train route. Its
-/// transit links form a separate component of three nodes, which a balanced cut keeps together.
-const PARTITIONS_SPLITTING_THE_TRAIN_ROUTE: u32 = 5;
-
 #[deterministic_id_test(matsim_rust)]
 fn timetable_train_and_queue_bus_match_the_pinned_reference() {
-    assert_timetable_mixed_matches(1);
+    assert_timetable_train_and_queue_bus_matches_reference(1);
 }
 
-/// The same fixture with a partitioning that splits the train's route, so every train carries
-/// passengers across a partition boundary before they alight.
 #[deterministic_id_test(matsim_rust)]
 fn timetable_train_and_queue_bus_match_the_pinned_reference_across_partitions() {
-    assert_timetable_mixed_matches(PARTITIONS_SPLITTING_THE_TRAIN_ROUTE);
+    assert_timetable_train_and_queue_bus_matches_reference(2);
 }
 
-fn assert_timetable_mixed_matches(num_parts: u32) {
+fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     let mut config = Config::from_args(CommandLineArgs::new_with_path(
         "./tests/resources/pt_simulated/timetable_mixed.yml",
     ));
     config.partitioning_mut().num_parts = num_parts;
-    if num_parts > 1 {
-        // An unbalanced cut is what separates the train's stops; a balanced one keeps the transit
-        // component in one partition.
-        let PartitionMethod::Metis(options) = &mut config.partitioning_mut().method else {
-            unreachable!("the fixture partitions with Metis")
-        };
-        options.imbalance_factor = 1.0;
-    }
+    config.output_mut().output_dir =
+        Path::new("./test_output/simulation").join(format!("pt_timetable_mixed_{num_parts}_parts"));
     let output_dir = config.output().output_dir.clone();
     let reference = read_reference("timetable_mixed");
     verify_same_conditions(&reference, &config);
 
-    run(config);
+    if num_parts == 1 {
+        run(config);
+    } else {
+        let mut scenario = Scenario::load(config);
+        common::force_train_boundary(&mut scenario);
+        ControllerBuilder::default_with_scenario(scenario)
+            .build()
+            .unwrap()
+            .run();
+    }
 
     let rust = normalize_partitioned_events(&output_dir.join("events"), num_parts);
     let relevant = |event: &&Value| {
@@ -292,42 +292,147 @@ fn assert_timetable_mixed_matches(num_parts: u32) {
         rust.iter()
             .any(|event| event["type"] == "stuckAndAbort" && event["person"] == "stranded-at-end")
     );
-    if num_parts > 1 {
-        assert_timetable_train_crossed_a_partition_boundary(&output_dir, num_parts);
+}
+
+#[deterministic_id_test(matsim_rust)]
+fn timetable_link_events_follow_sbb_iteration_interval_without_changing_passengers() {
+    let reference = read_reference("timetable_link_events");
+    let output = |name: &str| Path::new("./test_output/simulation").join(name);
+    let mut baseline = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_simulated/timetable_mixed.yml",
+    ));
+    baseline.controller_mut().last_iteration = 2;
+    baseline.controller_mut().write_events_interval = 1;
+    baseline.output_mut().output_dir = output("pt_link_events_disabled");
+    let baseline_dir = baseline.output().output_dir.clone();
+    run(baseline);
+
+    let mut enabled = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_simulated/timetable_mixed.yml",
+    ));
+    enabled.controller_mut().last_iteration = 2;
+    enabled.controller_mut().write_events_interval = 1;
+    enabled.transit_mut().create_link_events_interval = 2;
+    verify_same_conditions(&reference, &enabled);
+    enabled.output_mut().output_dir = output("pt_link_events_interval");
+    let enabled_dir = enabled.output().output_dir.clone();
+    run(enabled);
+
+    for iteration in 0..=2 {
+        let baseline_events: Vec<_> =
+            normalize_events(&iteration_events_file(&baseline_dir, iteration))
+                .into_iter()
+                .filter(|event| !is_train_link_or_traffic_event(event))
+                .collect();
+        let enabled_path = iteration_events_file(&enabled_dir, iteration);
+        let enabled_events: Vec<_> = normalize_events(&enabled_path)
+            .into_iter()
+            .filter(|event| !is_train_link_or_traffic_event(event))
+            .collect();
+        assert_eq!(
+            baseline_events, enabled_events,
+            "synthetic link events changed passenger outcomes in iteration {iteration}"
+        );
+        let expected_synthetic: Vec<_> = reference
+            .events
+            .iter()
+            .filter(|event| iteration.is_multiple_of(2) && is_train_link_or_traffic_event(event))
+            .collect();
+        let actual = normalize_events(&enabled_path);
+        let actual_synthetic: Vec<_> = actual
+            .iter()
+            .filter(|event| is_train_link_or_traffic_event(event))
+            .collect();
+        assert_eq!(
+            actual_synthetic, expected_synthetic,
+            "synthetic vehicle events differ from pinned SBB output in iteration {iteration}"
+        );
+        let links = count_link_events(&enabled_path);
+        if iteration.is_multiple_of(2) {
+            assert!(
+                links.0 >= 9,
+                "expected multi-link output in iteration {iteration}: {links:?}"
+            );
+            assert_eq!(
+                links.0, links.1,
+                "unpaired synthetic link events in iteration {iteration}"
+            );
+        } else {
+            assert_eq!(
+                links,
+                (0, 0),
+                "link output enabled in iteration {iteration}"
+            );
+        }
+        let traffic = count_train_traffic_events(&enabled_path);
+        assert_eq!(
+            traffic,
+            if iteration.is_multiple_of(2) {
+                (3, 3)
+            } else {
+                (0, 0)
+            },
+            "traffic event output does not follow the interval in iteration {iteration}"
+        );
     }
 }
 
-/// Proves the partitioned run moved a timetable vehicle between workers: each worker writes its own
-/// event file, so a train whose stops are spread over two files cannot have stayed on one partition.
-fn assert_timetable_train_crossed_a_partition_boundary(output_dir: &Path, num_parts: u32) {
-    let mut stop_partitions = BTreeMap::<String, u32>::new();
-    for partition in 0..num_parts {
-        let path = output_dir.join(format!("events/events.{partition}.binpb"));
-        for event in normalize_events(&path).iter().filter(|event| {
-            event["type"] == "VehicleArrivesAtFacility" && event["vehicle"] == "train-0750"
-        }) {
-            let facility = event["facility"].as_str().unwrap().to_owned();
-            assert!(
-                stop_partitions
-                    .insert(facility.clone(), partition)
-                    .is_none(),
-                "train-0750 arrived at {facility} on two partitions"
-            );
+fn is_train_link_or_traffic_event(event: &Value) -> bool {
+    event["vehicle"]
+        .as_str()
+        .is_some_and(|vehicle| vehicle.starts_with("train-"))
+        && matches!(
+            event["type"].as_str(),
+            Some(
+                "entered link" | "left link" | "vehicle enters traffic" | "vehicle leaves traffic"
+            )
+        )
+}
+
+fn iteration_events_file(output_dir: &Path, iteration: u32) -> std::path::PathBuf {
+    output_dir
+        .join("ITERS")
+        .join(format!("it.{iteration}"))
+        .join("events")
+        .join("events.0.binpb")
+}
+
+fn count_link_events(path: &Path) -> (usize, usize) {
+    let counts = Rc::new(RefCell::new((0, 0)));
+    let sink = Rc::clone(&counts);
+    let mut manager = EventsManager::new();
+    manager.on::<LinkEnterEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().0 += 1;
         }
-    }
-    assert_eq!(
-        vec!["1", "2a", "3"],
-        stop_partitions
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        "the run must serve every train stop, or the crossing below proves nothing"
-    );
-    assert_ne!(
-        stop_partitions["1"], stop_partitions["3"],
-        "train-0750 served its whole route on one partition, so the fixture no longer covers \
-         cross-partition timetable journeys"
-    );
+    });
+    let sink = Rc::clone(&counts);
+    manager.on::<LinkLeaveEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().1 += 1;
+        }
+    });
+    read_events(&mut manager, path).unwrap();
+    *counts.borrow()
+}
+
+fn count_train_traffic_events(path: &Path) -> (usize, usize) {
+    let counts = Rc::new(RefCell::new((0, 0)));
+    let sink = Rc::clone(&counts);
+    let mut manager = EventsManager::new();
+    manager.on::<VehicleEntersTrafficEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().0 += 1;
+        }
+    });
+    let sink = Rc::clone(&counts);
+    manager.on::<VehicleLeavesTrafficEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().1 += 1;
+        }
+    });
+    read_events(&mut manager, path).unwrap();
+    *counts.borrow()
 }
 
 fn assert_queue_execution_matches(num_parts: u32) {
@@ -1006,6 +1111,40 @@ fn a_faster_shared_stop_transfer_beats_a_direct_service() {
     );
 }
 
+/// A full first departure changes the next iteration's route on both implementations.
+#[deterministic_id_test(matsim_rust)]
+fn previous_iteration_crowding_changes_the_pinned_reference_itinerary() {
+    let request = load_request("capacity_feedback");
+    let config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/capacity_feedback/config.yml",
+    ));
+    let reference = read_reference("capacity_feedback");
+    verify_same_conditions(&reference, &config);
+    let router = run(config);
+    let rust = calc_pt_route(&request, &router, None);
+    let expected = reference
+        .itineraries
+        .iter()
+        .find(|itinerary| itinerary["id"] == request["id"])
+        .expect("the crowded routing request is recorded in the reference");
+
+    let transfer = vec![
+        ride("a_to_b", "ra", "rb", 29100.0),
+        ride("b_to_c", "rb", "rc", 30000.0),
+    ];
+    assert_eq!(
+        rides(expected),
+        transfer,
+        "MATSim no longer avoids the full service"
+    );
+    assert_eq!(
+        rides(&rust),
+        transfer,
+        "Rust no longer avoids the full service"
+    );
+    assert_eq!(arrival_time(&rust), arrival_time(expected));
+}
+
 /// With no PT ride between the endpoints, `avoid` returns the cheapest feeder-only itinerary.
 #[deterministic_id_test(matsim_rust)]
 fn intermodal_feeder_only_routes_match_the_pinned_reference() {
@@ -1637,6 +1776,32 @@ fn normalize_event(event: &dyn EventTrait) -> Option<Value> {
         record.insert("transitLineId".into(), json!(event.line.external()));
         record.insert("transitRouteId".into(), json!(event.route.external()));
         record.insert("departureId".into(), json!(event.departure.external()));
+    } else if let Some(event) = any.downcast_ref::<LinkEnterEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(LinkEnterEvent::TYPE));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+    } else if let Some(event) = any.downcast_ref::<LinkLeaveEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(LinkLeaveEvent::TYPE));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+    } else if let Some(event) = any.downcast_ref::<VehicleEntersTrafficEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(VehicleEntersTrafficEvent::TYPE));
+        record.insert("person".into(), json!(event.person.external()));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+        record.insert("networkMode".into(), json!(event.network_mode.external()));
+        record.insert("relativePosition".into(), json!(event.relative_position));
+    } else if let Some(event) = any.downcast_ref::<VehicleLeavesTrafficEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(VehicleLeavesTrafficEvent::TYPE));
+        record.insert("person".into(), json!(event.person.external()));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+        record.insert("networkMode".into(), json!(event.network_mode.external()));
+        record.insert("relativePosition".into(), json!(event.relative_position));
     } else if let Some(event) = any.downcast_ref::<VehicleArrivesAtFacilityEvent>() {
         record.insert("time".into(), json!(millis(seconds(event.time))));
         record.insert("type".into(), json!(VehicleArrivesAtFacilityEvent::TYPE));
@@ -1981,6 +2146,8 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
     let config = Config::from_args(CommandLineArgs::new_with_path(
         "./tests/resources/pt_reference/routing_person_specific_costs/config.yml",
     ));
+    let reference = read_reference("routing_person_specific_costs");
+    verify_same_conditions(&reference, &config);
     let router = run(config);
 
     let person_request = load_request_at("routing_person_specific_costs", 0);
@@ -2002,6 +2169,15 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
     let freight = internal_person(&freight_request);
     let person_route = calc_pt_route(&person_request, &router, Some(&person));
     let freight_route = calc_pt_route(&freight_request, &router, Some(&freight));
+    let reference_itinerary = |id: &str| {
+        reference
+            .itineraries
+            .iter()
+            .find(|itinerary| itinerary["id"] == id)
+            .unwrap_or_else(|| panic!("the reference is missing request {id}"))
+    };
+    let person_reference = reference_itinerary("person_prefers_rail");
+    let freight_reference = reference_itinerary("freight_prefers_bus");
 
     // The person subpopulation prefers rail: the single-ride direct service beats the bus
     // transfer by cost. The freight subpopulation inverts those utilities and prefers the bus
@@ -2020,6 +2196,35 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
         "the freight subpopulation inverts the per-mode utility and picks the bus transfer"
     );
     assert_ne!(rides(&person_route), rides(&freight_route));
+    assert_eq!(rides(person_reference), rides(&person_route));
+    assert_eq!(rides(freight_reference), rides(&freight_route));
+    assert_eq!(arrival_time(person_reference), arrival_time(&person_route));
+    assert_eq!(
+        arrival_time(freight_reference),
+        arrival_time(&freight_route)
+    );
+
+    assert_eq!(
+        calc_pt_route(&person_request, &router, Some(&person)),
+        person_route,
+        "repeating the same request should preserve its unique optimum"
+    );
+    let mut partitioned_config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/routing_person_specific_costs/config.yml",
+    ));
+    partitioned_config.partitioning_mut().num_parts = 2;
+    partitioned_config.output_mut().output_dir.push("two_parts");
+    let partitioned_router = run(partitioned_config);
+    assert_eq!(
+        calc_pt_route(&person_request, &partitioned_router, Some(&person)),
+        person_route,
+        "partition changes should preserve the default passenger's unique optimum"
+    );
+    assert_eq!(
+        calc_pt_route(&freight_request, &partitioned_router, Some(&freight)),
+        freight_route,
+        "partition changes should preserve the freight passenger's unique optimum"
+    );
 }
 
 /// The range profile includes both inclusive window boundaries and never repeats yesterday's

@@ -47,6 +47,13 @@ Network links must list their allowed modes explicitly: a link without modes all
 assumes `car` for links without a `modes` attribute, nothing is implied. Loading a network with such links logs a
 warning.
 
+Populations are read in parallel, both from XML and from protobuf. A reader thread splits the input into persons,
+which are parsed and converted by the rayon thread pool. The id store must stay independent of the number of threads:
+for protobuf, all ids except missing subpopulations are only looked up, and these are created in file order afterwards.
+For XML, all ids are created sequentially before the persons are converted, in the order in which converting the
+persons sorted by id one after another would create them (see `for_each_id_of_io_person`). Internal ids are the
+creation index of an id and never depend on hashing.
+
 Scenario ownership is split into three lifecycles. `Scenario` owns the input data while files are read.
 The controller turns it into `ControllerScenario`, which keeps immutable data in a shared `ScenarioCore`
 (`Arc<Network>`, `Arc<Garage>`, `Arc<TransitSchedule>`, `Arc<ActivityFacilities>`, `Arc<Config>`) and owns the
@@ -68,18 +75,11 @@ Transit vehicles are simulated when `transit.simulate_vehicles` is set, and tele
 a `ControllerScenario` then expands the schedule into per-departure vehicle runs once, before the Mobsim threads start, and
 every partition shares them. Routes whose service mode is listed in
 `transit.deterministic_service_modes` run stop-to-stop at timetable offsets; other services use the queue network engine.
-Queue vehicles are owned by the partition of their start link and
-drive through the network engine: they occupy links and compete for capacity like every other vehicle. A
-passenger waits on the partition that owns its access stop's link, which is the same partition as every vehicle serving that
-stop, so the waiting lists never cross partitions. A passenger that rides past a partition boundary travels inside the
-vehicle's backpack, and the partition where it alights resumes the agent.
-
-A timetable vehicle follows its schedule instead of the network, so it owns no link and belongs to the partition of the stop
-it is serving. It starts on the partition of its first stop and, after every stop, is handed to the partition owning the
-next stop's link through the same vehicle message, partition-event and migration-extension path a vehicle leaving a link
-takes; the receiving worker returns it to the timetable engine instead of the queue network engine. A vehicle therefore
-changes worker exactly when the stop it serves changes partition, which keeps it in place for that stop while its passengers
-ride inside it across the boundary.
+Timetable vehicles start on the partition of their first route link. Their scheduled link transitions hand the vehicle,
+driver, and riders to the next link's owner through the normal vehicle migration message. This keeps boarding queues on
+the partition that owns each stop link, and the worker that handles an alighting stop resumes the passenger there. Queue
+vehicles use the network engine and occupy links and compete for capacity like every other vehicle; timetable vehicles
+follow their scheduled stop times and do not consume network link capacity.
 
 Each worker owns a thread-local travel-time collector shared between its event buses without a cross-thread lock.
 The collector associates vehicles with the network mode of their current leg and records link observations separately
@@ -91,6 +91,18 @@ The shared router reads the snapshot without taking the submission lock; unobser
 `prepare_for_mobsim` uses the previous iteration's snapshot, or an empty snapshot for the first iteration. The workers'
 iteration-reset hooks clear the collectors before the next Mobsim. No event-file output is required for travel-time
 collection.
+
+Transit vehicle stop handling records segment occupancy and compatible passengers denied by a full vehicle in one
+shared, ordered collector. After all workers return, the controller drains that collector and atomically publishes a
+complete immutable snapshot before replanning. Transit routing adds the observed occupancy fraction times each
+scheduled segment duration and the observed failed-boarding fraction times the next scheduled headway to predicted cost.
+These costs affect route choice only; vehicle capacity remains an execution constraint in the next Mobsim. Collection
+does not write events.
+
+This feedback cost is a Rust extension rather than an exact port of MATSim 2026.0's optional
+`SwissRailRaptor` capacity constraint. That reference feature defaults off and uses observed waiting
+windows to exclude departures after failed boarding; it does not add these occupancy and headway
+costs.
 
 Worker extensions can observe state moving between partitions through a fourth, thread-local
 `PartitionChangeExtensionsManager` bus alongside the simulation-event, Mobsim-lifecycle, and partition-event buses.
@@ -108,7 +120,9 @@ module verifies iteration and rank and merges the populations deterministically 
 scores each reconstructed experienced plan and copies the result to exactly the selected original plan. Experienced
 plans receive the same score and are written only when `scoring.write_experienced_plans` and the configured plan
 writing interval allow it. Collection and scoring always run, even when experienced-plan output is disabled, so
-replanning can consume the updated selected-plan scores. Backpacks do not return to an initial or "home" partition.
+replanning can consume the updated selected-plan scores. The only exception is `scoring.mode: Disabled`: the controller
+then registers no backpacking engines, collects no experienced plans, and sets the score of each selected plan to
+`None`. Backpacks do not return to an initial or "home" partition.
 Scoring uses the public `PlanScorer` trait and reads only the experienced plan. The controller builder accepts a
 `Box<dyn PlanScorer>`; without one, it creates `CharyparNagelScoringFunction`. The alternative
 `OnlyTravelTimeDependentScoring` assigns the negative elapsed seconds of completed trips, including transfer waits.

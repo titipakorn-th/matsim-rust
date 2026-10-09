@@ -17,6 +17,9 @@
 	<module name="network">
 		<param name="inputNetworkFile" value="../../../../assets/pt_tutorial/multimodalnetwork.xml" />
 	</module>
+	<module name="plans">
+		<param name="inputPlansFile" value="population.xml" />
+	</module>
 
 	<module name="vehicles">
 		<param name="vehiclesFile" value="../../../../assets/pt_tutorial/vehicles.xml" />
@@ -31,6 +34,7 @@
 
 	<module name="swissRailRaptor">
 		<param name="useModeMappingForPassengers" value="true" />
+		<param name="scoringParameters" value="Individual" />
 		<parameterset type="modeMapping">
 			<param name="routeMode" value="train" />
 			<param name="passengerMode" value="rail" />
@@ -43,6 +47,7 @@
 
 	<module name="scoring">
 		<parameterset type="scoringParameters">
+			<param name="subpopulation" value="default" />
 			<parameterset type="modeParams">
 				<param name="mode" value="pt" />
 				<param name="marginalUtilityOfTraveling_util_hr" value="-6.0" />
@@ -63,25 +68,31 @@
 				<param name="mode" value="road" />
 				<param name="marginalUtilityOfTraveling_util_hr" value="-24.0" />
 			</parameterset>
-			<!-- Freight overrules rail as expensive, road as cheap: the freight passenger picks
-			     the bus transfer instead of the rail direct service. -->
+			<param name="performing" value="6.0" />
+		</parameterset>
+		<parameterset type="scoringParameters">
+			<param name="subpopulation" value="freight" />
+			<param name="performing" value="6.0" />
+			<!-- Freight prefers the bus transfer over the direct rail service. -->
 			<parameterset type="modeParams">
-				<param name="subpopulation" value="freight" />
+				<param name="mode" value="pt" />
+				<param name="marginalUtilityOfTraveling_util_hr" value="-6.0" />
+			</parameterset>
+			<parameterset type="modeParams">
+				<param name="mode" value="walk" />
+				<param name="marginalUtilityOfTraveling_util_hr" value="-6.0" />
+			</parameterset>
+			<parameterset type="modeParams">
+				<param name="mode" value="car" />
+				<param name="marginalUtilityOfTraveling_util_hr" value="-6.0" />
+			</parameterset>
+			<parameterset type="modeParams">
 				<param name="mode" value="rail" />
 				<param name="marginalUtilityOfTraveling_util_hr" value="-24.0" />
 			</parameterset>
 			<parameterset type="modeParams">
-				<param name="subpopulation" value="freight" />
 				<param name="mode" value="road" />
 				<param name="marginalUtilityOfTraveling_util_hr" value="-1.0" />
-			</parameterset>
-			<parameterset type="agentParams">
-				<param name="subpopulation" value="person" />
-				<param name="performing" value="6.0" />
-			</parameterset>
-			<parameterset type="agentParams">
-				<param name="subpopulation" value="freight" />
-				<param name="performing" value="6.0" />
 			</parameterset>
 		</parameterset>
 	</module>
