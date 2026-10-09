@@ -301,6 +301,7 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     assert_eq!(trips.matches("train-to-bus-transfer").count(), 2, "{trips}");
     let mut vehicle_lines = std::collections::BTreeMap::new();
     let mut passenger_waits = std::collections::BTreeMap::new();
+    let mut passenger_ride_lines = std::collections::BTreeMap::new();
     let mut java_stop_counts =
         std::collections::BTreeMap::<(u64, String, String), (u64, u64)>::new();
     for event in &reference.events {
@@ -331,22 +332,31 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
                 let vehicle = event["vehicle"].as_str().unwrap();
                 let line = vehicle_lines.get(vehicle).unwrap().clone();
                 let (boarding_stop, alighting_stop) = passenger_waits.get(person).unwrap();
-                let stop = if kind == "PersonEntersVehicle" {
-                    boarding_stop
-                } else {
-                    alighting_stop
-                };
-                let counts = java_stop_counts
-                    .entry((
-                        (event["time"].as_f64().unwrap() as u64) / 3600 * 3600,
-                        line,
-                        stop.to_owned(),
-                    ))
-                    .or_default();
                 if kind == "PersonEntersVehicle" {
-                    counts.0 += 1;
-                } else {
-                    counts.1 += 1;
+                    java_stop_counts
+                        .entry((
+                            (event["time"].as_f64().unwrap() as u64) / 3600 * 3600,
+                            line.clone(),
+                            boarding_stop.clone(),
+                        ))
+                        .or_default()
+                        .0 += 1;
+                    passenger_ride_lines.insert(person.to_owned(), line);
+                }
+            }
+            Some("arrival") if event["legMode"] == "pt" => {
+                let person = event["person"].as_str().unwrap();
+                if !person.starts_with("pt_") {
+                    let line = passenger_ride_lines.remove(person).unwrap();
+                    let (_, alighting_stop) = passenger_waits.get(person).unwrap();
+                    java_stop_counts
+                        .entry((
+                            (event["time"].as_f64().unwrap() as u64) / 3600 * 3600,
+                            line,
+                            alighting_stop.clone(),
+                        ))
+                        .or_default()
+                        .1 += 1;
                 }
             }
             _ => {}
