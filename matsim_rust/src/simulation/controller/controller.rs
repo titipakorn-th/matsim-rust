@@ -113,13 +113,6 @@ impl ControllerBuilder {
                     .to_owned(),
             );
         }
-        if !transit.deterministic_service_modes.is_empty()
-            && self.scenario.config.partitioning().num_parts != 1
-        {
-            return Err(
-                "transit.deterministic_service_modes currently requires one partition".to_owned(),
-            );
-        }
         for mode in &transit.deterministic_service_modes {
             if self.scenario.config.qsim().main_modes.contains(mode) {
                 return Err(format!(
@@ -207,7 +200,6 @@ impl ControllerBuilder {
         let transit_capacity_feedback = Arc::new(Default::default());
         let transit_capacity_snapshot = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
 
-        // Without scoring, no backpacking engines are registered and no experienced plans are collected.
         let experienced_plans = if config.scoring().mode == ScoringMode::Enabled {
             let (worker_registrations, controller_registration, experienced_plans) =
                 scoring::create_registrations(&scenario);
@@ -533,7 +525,6 @@ impl Controller {
         // Initialized after the output directory is prepared, so the controller files are not deleted.
         let _controller_log_guards = init_controller_logging(&self.config);
         let simulation_started = Instant::now();
-
         let mut mobsim_workers = self.start_mobsim_workers();
         let scoring_pool = ScoringPool::new(&self.scenario.core, self.scoring_function.take());
         let replanning_pool = ReplanningPool::new(
@@ -737,7 +728,6 @@ impl Controller {
         Population::from_agents(agents)
     }
 
-    #[tracing::instrument(level = "info", skip_all, fields(iteration = iteration))]
     fn run_scoring_phase(
         &mut self,
         iteration: u32,
@@ -793,7 +783,6 @@ impl Controller {
         population
     }
 
-    #[tracing::instrument(level = "info", skip_all, fields(iteration = iteration))]
     fn run_replanning_phase(
         &mut self,
         iteration: u32,

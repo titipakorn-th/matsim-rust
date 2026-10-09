@@ -31,8 +31,7 @@ impl<C> Simulation<C>
 where
     C: SimCommunicator,
 {
-    #[hotpath::measure]
-    #[tracing::instrument(level = "info", skip(self), fields(rank = self.leg_engine.net_message_broker().rank(), iteration = self.comp_env.mobsim_events_manager_borrow_mut().iteration()))]
+    #[tracing::instrument(level = "info", skip(self), fields(rank = self.leg_engine.net_message_broker().rank()))]
     pub fn run(&mut self) -> Vec<SimulationAgent> {
         // use fixed start and end times
         let mut now = self.start_tick;
@@ -169,6 +168,7 @@ pub struct SimulationBuilder<C: SimCommunicator> {
     net_message_broker: NetMessageBroker<C>,
     comp_env: ThreadLocalComputationalEnvironment,
     agent_source: DynAgentSource,
+    iteration: u32,
 }
 
 impl<C: SimCommunicator> SimulationBuilder<C> {
@@ -177,12 +177,14 @@ impl<C: SimCommunicator> SimulationBuilder<C> {
         net_message_broker: NetMessageBroker<C>,
         comp_env: ThreadLocalComputationalEnvironment,
         agent_source: DynAgentSource,
+        iteration: u32,
     ) -> Self {
         SimulationBuilder {
             input,
             net_message_broker,
             comp_env,
             agent_source,
+            iteration,
         }
     }
 
@@ -223,6 +225,7 @@ impl<C: SimCommunicator> SimulationBuilder<C> {
                 self.comp_env.clone(),
                 clock,
                 clock.tick_to_time(start_tick),
+                self.iteration,
             )
         });
 

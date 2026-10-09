@@ -150,15 +150,8 @@ fn init_tracing(config: &Config, primary: bool, file_discriminant: &str, dir: &P
 
 fn create_filter(level: Level) -> (EnvFilter, EnvFilter) {
     let routing_mod = "matsim_rust::simulation::agents::agent_logic";
-    let routing_search_mod = "matsim_rust::simulation::replanning::routing::a_star";
-    let routing_filter = EnvFilter::new(format!(
-        "{}={},{}=trace",
-        routing_mod, level, routing_search_mod
-    ));
-    let general_filter = EnvFilter::new(format!(
-        "{},{routing_mod}=off,{routing_search_mod}=off",
-        level
-    ));
+    let routing_filter = EnvFilter::new(format!("{}={}", routing_mod, level));
+    let general_filter = EnvFilter::new(format!("{},{}=off", level, routing_mod));
     (routing_filter, general_filter)
 }
 

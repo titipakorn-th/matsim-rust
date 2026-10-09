@@ -8,6 +8,8 @@
 //! test suite uses: the controller writes the events, and the router the controller built answers
 //! routing requests.
 
+mod common;
+
 use macros::deterministic_id_test;
 use matsim_rust::simulation::InternalAttributes;
 use matsim_rust::simulation::config::{CommandLineArgs, Config};
@@ -15,9 +17,11 @@ use matsim_rust::simulation::controller::controller::ControllerBuilder;
 use matsim_rust::simulation::events::utils::{read_events, read_partitioned_events};
 use matsim_rust::simulation::events::{
     ActivityEndEvent, ActivityStartEvent, AgentWaitingForPtEvent, EventTrait, EventsManager,
-    PersonArrivalEvent, PersonDepartureEvent, PersonEntersVehicleEvent, PersonLeavesVehicleEvent,
-    PersonStuckEvent, PtTeleportationArrivalEvent, TeleportationArrivalEvent,
-    TransitDriverStartsEvent, VehicleArrivesAtFacilityEvent, VehicleDepartsAtFacilityEvent,
+    LinkEnterEvent, LinkLeaveEvent, PersonArrivalEvent, PersonDepartureEvent,
+    PersonEntersVehicleEvent, PersonLeavesVehicleEvent, PersonStuckEvent,
+    PtTeleportationArrivalEvent, TeleportationArrivalEvent, TransitDriverStartsEvent,
+    VehicleArrivesAtFacilityEvent, VehicleDepartsAtFacilityEvent, VehicleEntersTrafficEvent,
+    VehicleLeavesTrafficEvent,
 };
 use matsim_rust::simulation::id::Id;
 use matsim_rust::simulation::replanning::routing::{
@@ -142,16 +146,37 @@ fn queue_execution_matches_the_pinned_reference_across_partitions() {
 
 #[deterministic_id_test(matsim_rust)]
 fn timetable_train_and_queue_bus_match_the_pinned_reference() {
-    let config = Config::from_args(CommandLineArgs::new_with_path(
+    assert_timetable_train_and_queue_bus_matches_reference(1);
+}
+
+#[deterministic_id_test(matsim_rust)]
+fn timetable_train_and_queue_bus_match_the_pinned_reference_across_partitions() {
+    assert_timetable_train_and_queue_bus_matches_reference(2);
+}
+
+fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
+    let mut config = Config::from_args(CommandLineArgs::new_with_path(
         "./tests/resources/pt_simulated/timetable_mixed.yml",
     ));
+    config.partitioning_mut().num_parts = num_parts;
+    config.output_mut().output_dir =
+        Path::new("./test_output/simulation").join(format!("pt_timetable_mixed_{num_parts}_parts"));
     let output_dir = config.output().output_dir.clone();
     let reference = read_reference("timetable_mixed");
     verify_same_conditions(&reference, &config);
 
-    run(config);
+    if num_parts == 1 {
+        run(config);
+    } else {
+        let mut scenario = Scenario::load(config);
+        common::force_train_boundary(&mut scenario);
+        ControllerBuilder::default_with_scenario(scenario)
+            .build()
+            .unwrap()
+            .run();
+    }
 
-    let rust = normalize_partitioned_events(&output_dir.join("events"), 1);
+    let rust = normalize_partitioned_events(&output_dir.join("events"), num_parts);
     let relevant = |event: &&Value| {
         !event
             .get("person")
@@ -267,6 +292,147 @@ fn timetable_train_and_queue_bus_match_the_pinned_reference() {
         rust.iter()
             .any(|event| event["type"] == "stuckAndAbort" && event["person"] == "stranded-at-end")
     );
+}
+
+#[deterministic_id_test(matsim_rust)]
+fn timetable_link_events_follow_sbb_iteration_interval_without_changing_passengers() {
+    let reference = read_reference("timetable_link_events");
+    let output = |name: &str| Path::new("./test_output/simulation").join(name);
+    let mut baseline = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_simulated/timetable_mixed.yml",
+    ));
+    baseline.controller_mut().last_iteration = 2;
+    baseline.controller_mut().write_events_interval = 1;
+    baseline.output_mut().output_dir = output("pt_link_events_disabled");
+    let baseline_dir = baseline.output().output_dir.clone();
+    run(baseline);
+
+    let mut enabled = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_simulated/timetable_mixed.yml",
+    ));
+    enabled.controller_mut().last_iteration = 2;
+    enabled.controller_mut().write_events_interval = 1;
+    enabled.transit_mut().create_link_events_interval = 2;
+    verify_same_conditions(&reference, &enabled);
+    enabled.output_mut().output_dir = output("pt_link_events_interval");
+    let enabled_dir = enabled.output().output_dir.clone();
+    run(enabled);
+
+    for iteration in 0..=2 {
+        let baseline_events: Vec<_> =
+            normalize_events(&iteration_events_file(&baseline_dir, iteration))
+                .into_iter()
+                .filter(|event| !is_train_link_or_traffic_event(event))
+                .collect();
+        let enabled_path = iteration_events_file(&enabled_dir, iteration);
+        let enabled_events: Vec<_> = normalize_events(&enabled_path)
+            .into_iter()
+            .filter(|event| !is_train_link_or_traffic_event(event))
+            .collect();
+        assert_eq!(
+            baseline_events, enabled_events,
+            "synthetic link events changed passenger outcomes in iteration {iteration}"
+        );
+        let expected_synthetic: Vec<_> = reference
+            .events
+            .iter()
+            .filter(|event| iteration.is_multiple_of(2) && is_train_link_or_traffic_event(event))
+            .collect();
+        let actual = normalize_events(&enabled_path);
+        let actual_synthetic: Vec<_> = actual
+            .iter()
+            .filter(|event| is_train_link_or_traffic_event(event))
+            .collect();
+        assert_eq!(
+            actual_synthetic, expected_synthetic,
+            "synthetic vehicle events differ from pinned SBB output in iteration {iteration}"
+        );
+        let links = count_link_events(&enabled_path);
+        if iteration.is_multiple_of(2) {
+            assert!(
+                links.0 >= 9,
+                "expected multi-link output in iteration {iteration}: {links:?}"
+            );
+            assert_eq!(
+                links.0, links.1,
+                "unpaired synthetic link events in iteration {iteration}"
+            );
+        } else {
+            assert_eq!(
+                links,
+                (0, 0),
+                "link output enabled in iteration {iteration}"
+            );
+        }
+        let traffic = count_train_traffic_events(&enabled_path);
+        assert_eq!(
+            traffic,
+            if iteration.is_multiple_of(2) {
+                (3, 3)
+            } else {
+                (0, 0)
+            },
+            "traffic event output does not follow the interval in iteration {iteration}"
+        );
+    }
+}
+
+fn is_train_link_or_traffic_event(event: &Value) -> bool {
+    event["vehicle"]
+        .as_str()
+        .is_some_and(|vehicle| vehicle.starts_with("train-"))
+        && matches!(
+            event["type"].as_str(),
+            Some(
+                "entered link" | "left link" | "vehicle enters traffic" | "vehicle leaves traffic"
+            )
+        )
+}
+
+fn iteration_events_file(output_dir: &Path, iteration: u32) -> std::path::PathBuf {
+    output_dir
+        .join("ITERS")
+        .join(format!("it.{iteration}"))
+        .join("events")
+        .join("events.0.binpb")
+}
+
+fn count_link_events(path: &Path) -> (usize, usize) {
+    let counts = Rc::new(RefCell::new((0, 0)));
+    let sink = Rc::clone(&counts);
+    let mut manager = EventsManager::new();
+    manager.on::<LinkEnterEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().0 += 1;
+        }
+    });
+    let sink = Rc::clone(&counts);
+    manager.on::<LinkLeaveEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().1 += 1;
+        }
+    });
+    read_events(&mut manager, path).unwrap();
+    *counts.borrow()
+}
+
+fn count_train_traffic_events(path: &Path) -> (usize, usize) {
+    let counts = Rc::new(RefCell::new((0, 0)));
+    let sink = Rc::clone(&counts);
+    let mut manager = EventsManager::new();
+    manager.on::<VehicleEntersTrafficEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().0 += 1;
+        }
+    });
+    let sink = Rc::clone(&counts);
+    manager.on::<VehicleLeavesTrafficEvent, _>(move |event| {
+        if event.vehicle.external().starts_with("train-") {
+            sink.borrow_mut().1 += 1;
+        }
+    });
+    read_events(&mut manager, path).unwrap();
+    *counts.borrow()
 }
 
 fn assert_queue_execution_matches(num_parts: u32) {
@@ -1610,6 +1776,32 @@ fn normalize_event(event: &dyn EventTrait) -> Option<Value> {
         record.insert("transitLineId".into(), json!(event.line.external()));
         record.insert("transitRouteId".into(), json!(event.route.external()));
         record.insert("departureId".into(), json!(event.departure.external()));
+    } else if let Some(event) = any.downcast_ref::<LinkEnterEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(LinkEnterEvent::TYPE));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+    } else if let Some(event) = any.downcast_ref::<LinkLeaveEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(LinkLeaveEvent::TYPE));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+    } else if let Some(event) = any.downcast_ref::<VehicleEntersTrafficEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(VehicleEntersTrafficEvent::TYPE));
+        record.insert("person".into(), json!(event.person.external()));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+        record.insert("networkMode".into(), json!(event.network_mode.external()));
+        record.insert("relativePosition".into(), json!(event.relative_position));
+    } else if let Some(event) = any.downcast_ref::<VehicleLeavesTrafficEvent>() {
+        record.insert("time".into(), json!(millis(seconds(event.time))));
+        record.insert("type".into(), json!(VehicleLeavesTrafficEvent::TYPE));
+        record.insert("person".into(), json!(event.person.external()));
+        record.insert("vehicle".into(), json!(event.vehicle.external()));
+        record.insert("link".into(), json!(event.link.external()));
+        record.insert("networkMode".into(), json!(event.network_mode.external()));
+        record.insert("relativePosition".into(), json!(event.relative_position));
     } else if let Some(event) = any.downcast_ref::<VehicleArrivesAtFacilityEvent>() {
         record.insert("time".into(), json!(millis(seconds(event.time))));
         record.insert("type".into(), json!(VehicleArrivesAtFacilityEvent::TYPE));

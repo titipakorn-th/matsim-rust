@@ -402,14 +402,12 @@ cargo run --release --bin analyze -- --run-dir /path/to/baseline --ensemble-mani
 This reads completed runs and writes `baseline/ensemble/`. The manifest format,
 compatibility checks, and statistical assumptions are documented in
 [analysis](docs/analysis.md).
-
-To make runs traceable, the git state of the source tree is embedded at compile time (e.g. `v1.0.0-12-g4f96e9b2-dirty`).
-It is printed by `local_qsim --version` and logged as the first message whenever logging is initialized, including the
-per-process log files in the output directory.
-The suffix `-dirty` means the binary was built with uncommitted changes to tracked files; `-nogit` means no git metadata
-was available at build time.
-
 ## Create input files
+
+To make runs traceable, the source tree's git state is embedded at compile time (for example,
+`v1.0.0-12-g4f96e9b2-dirty`), shown by `local_qsim --version`, and logged when logging is initialized,
+including in per-process log files. A `-dirty` suffix means tracked source files were modified at build
+time; `-nogit` means git metadata was unavailable.
 
 The simulator accepts XML and protobuf inputs. To convert XML inputs to protobuf
 for faster loading, run:
