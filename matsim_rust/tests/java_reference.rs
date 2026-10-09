@@ -299,31 +299,76 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     let report = output_dir.join("analysis");
     let trips = std::fs::read_to_string(report.join("transit_trips.csv")).unwrap();
     assert_eq!(trips.matches("train-to-bus-transfer").count(), 2, "{trips}");
-    let java_boardings = reference
-        .events
-        .iter()
-        .filter(|event| {
-            event["type"] == "PersonEntersVehicle"
-                && !event["person"].as_str().unwrap().starts_with("pt_")
-        })
-        .count() as u64;
-    let java_alightings = reference
-        .events
-        .iter()
-        .filter(|event| {
-            event["type"] == "PersonLeavesVehicle"
-                && !event["person"].as_str().unwrap().starts_with("pt_")
-        })
-        .count() as u64;
+    let mut vehicle_lines = std::collections::BTreeMap::new();
+    let mut passenger_waits = std::collections::BTreeMap::new();
+    let mut java_stop_counts =
+        std::collections::BTreeMap::<(u64, String, String), (u64, u64)>::new();
+    for event in &reference.events {
+        match event["type"].as_str() {
+            Some("TransitDriverStarts") => {
+                vehicle_lines.insert(
+                    event["vehicleId"].as_str().unwrap().to_owned(),
+                    event["transitLineId"].as_str().unwrap().to_owned(),
+                );
+            }
+            Some("waitingForPt") => {
+                let person = event["person"].as_str().unwrap();
+                if !person.starts_with("pt_") {
+                    passenger_waits.insert(
+                        person.to_owned(),
+                        (
+                            event["atStop"].as_str().unwrap().to_owned(),
+                            event["destinationStop"].as_str().unwrap().to_owned(),
+                        ),
+                    );
+                }
+            }
+            Some(kind @ ("PersonEntersVehicle" | "PersonLeavesVehicle")) => {
+                let person = event["person"].as_str().unwrap();
+                if person.starts_with("pt_") {
+                    continue;
+                }
+                let vehicle = event["vehicle"].as_str().unwrap();
+                let line = vehicle_lines.get(vehicle).unwrap().clone();
+                let (boarding_stop, alighting_stop) = passenger_waits.get(person).unwrap();
+                let stop = if kind == "PersonEntersVehicle" {
+                    boarding_stop
+                } else {
+                    alighting_stop
+                };
+                let counts = java_stop_counts
+                    .entry((
+                        (event["time"].as_f64().unwrap() as u64) / 3600 * 3600,
+                        line,
+                        stop.to_owned(),
+                    ))
+                    .or_default();
+                if kind == "PersonEntersVehicle" {
+                    counts.0 += 1;
+                } else {
+                    counts.1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
     let mut stop_counts = csv::Reader::from_path(report.join("transit_stop_hourly.csv")).unwrap();
-    let (mut rust_boardings, mut rust_alightings) = (0, 0);
+    let mut rust_stop_counts = std::collections::BTreeMap::new();
     for row in stop_counts.records() {
         let row = row.unwrap();
-        rust_boardings += row[3].parse::<u64>().unwrap();
-        rust_alightings += row[4].parse::<u64>().unwrap();
+        rust_stop_counts.insert(
+            (
+                row[0].parse::<u64>().unwrap(),
+                row[1].to_owned(),
+                row[2].to_owned(),
+            ),
+            (
+                row[3].parse::<u64>().unwrap(),
+                row[4].parse::<u64>().unwrap(),
+            ),
+        );
     }
-    assert_eq!(rust_boardings, java_boardings, "{trips}");
-    assert_eq!(rust_alightings, java_alightings, "{trips}");
+    assert_eq!(rust_stop_counts, java_stop_counts);
     for (person, vehicle) in [
         ("capacity-a", "train-0800"),
         ("capacity-b", "train-0750"),
