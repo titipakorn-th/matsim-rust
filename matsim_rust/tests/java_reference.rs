@@ -347,6 +347,7 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
             Some("arrival") if event["legMode"] == "pt" => {
                 let person = event["person"].as_str().unwrap();
                 if !person.starts_with("pt_") {
+                    // The report bins alightings at passenger arrival, not vehicle leave time.
                     let line = passenger_ride_lines.remove(person).unwrap();
                     let (_, alighting_stop) = passenger_waits.get(person).unwrap();
                     java_stop_counts
