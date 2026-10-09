@@ -299,6 +299,31 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     let report = output_dir.join("analysis");
     let trips = std::fs::read_to_string(report.join("transit_trips.csv")).unwrap();
     assert_eq!(trips.matches("train-to-bus-transfer").count(), 2, "{trips}");
+    let java_boardings = reference
+        .events
+        .iter()
+        .filter(|event| {
+            event["type"] == "PersonEntersVehicle"
+                && !event["person"].as_str().unwrap().starts_with("pt_")
+        })
+        .count() as u64;
+    let java_alightings = reference
+        .events
+        .iter()
+        .filter(|event| {
+            event["type"] == "PersonLeavesVehicle"
+                && !event["person"].as_str().unwrap().starts_with("pt_")
+        })
+        .count() as u64;
+    let mut stop_counts = csv::Reader::from_path(report.join("transit_stop_hourly.csv")).unwrap();
+    let (mut rust_boardings, mut rust_alightings) = (0, 0);
+    for row in stop_counts.records() {
+        let row = row.unwrap();
+        rust_boardings += row[3].parse::<u64>().unwrap();
+        rust_alightings += row[4].parse::<u64>().unwrap();
+    }
+    assert_eq!(rust_boardings, java_boardings, "{trips}");
+    assert_eq!(rust_alightings, java_alightings, "{trips}");
     for (person, vehicle) in [
         ("capacity-a", "train-0800"),
         ("capacity-b", "train-0750"),
