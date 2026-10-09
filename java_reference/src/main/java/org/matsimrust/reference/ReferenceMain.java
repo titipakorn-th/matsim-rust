@@ -221,9 +221,13 @@ public final class ReferenceMain {
             itinerary.put("id", request.string("id"));
             itinerary.set("request", request.node());
 
-            Person person = !request.node().hasNonNull("person")
+            Json personRequest = request.field("person");
+            String personId = personRequest == null
+                    ? (request.node().hasNonNull("person") ? request.string("person") : null)
+                    : personRequest.string("id");
+            Person person = personId == null
                     ? null
-                    : controler.getScenario().getPopulation().getPersons().get(Id.create(request.string("person"), Person.class));
+                    : controler.getScenario().getPopulation().getPersons().get(Id.create(personId, Person.class));
             Facility from = facility(controler.getScenario(), "probe_from_" + request.string("id"), request.field("from"));
             Facility to = facility(controler.getScenario(), "probe_to_" + request.string("id"), request.field("to"));
 
