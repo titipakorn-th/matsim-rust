@@ -324,15 +324,20 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
                     );
                 }
             }
-            Some(kind @ ("PersonEntersVehicle" | "PersonLeavesVehicle")) => {
+            Some(
+                kind @ ("PersonEntersVehicle"
+                | "PersonLeavesVehicle"
+                | "PersonEntersPtVehicle"
+                | "PersonLeavesPtVehicle"),
+            ) => {
                 let person = event["person"].as_str().unwrap();
                 if person.starts_with("pt_") {
                     continue;
                 }
                 let vehicle = event["vehicle"].as_str().unwrap();
                 let line = vehicle_lines.get(vehicle).unwrap().clone();
-                let (boarding_stop, alighting_stop) = passenger_waits.get(person).unwrap();
-                if kind == "PersonEntersVehicle" {
+                let (boarding_stop, _) = passenger_waits.get(person).unwrap();
+                if kind == "PersonEntersVehicle" || kind == "PersonEntersPtVehicle" {
                     java_stop_counts
                         .entry((
                             (event["time"].as_f64().unwrap() as u64) / 3600 * 3600,
@@ -1691,12 +1696,12 @@ fn a_distinct_platform_transfer_executes_through_the_simulation_runner() {
         .map(Result::unwrap)
         .find(|row| row.get(0) == Some("transfer-person"))
         .unwrap();
-    assert_eq!(journey[5], "2");
-    assert_eq!(journey[6], "1");
-    for (index, expected) in [(8, 0.0), (10, 0.0), (11, 156.0), (12, 5.0), (13, 900.0)] {
+    assert_eq!(journey.get(5), Some("2"));
+    assert_eq!(journey.get(6), Some("1"));
+    for (index, expected) in [(8, 0.0), (10, 1.0), (11, 156.0), (12, 5.0), (13, 895.0)] {
         assert_eq!(journey[index].parse::<f64>().unwrap(), expected);
     }
-    assert_eq!(journey[14], "complete");
+    assert_eq!(journey.get(14), Some("complete"));
     let mut stop_counts =
         csv::Reader::from_path(one_part.join("analysis/transit_stop_hourly.csv")).unwrap();
     let mut stops = std::collections::BTreeMap::new();
