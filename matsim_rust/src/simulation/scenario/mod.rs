@@ -349,6 +349,7 @@ impl ControllerScenario {
     pub(crate) fn split_for_mobsim(
         &mut self,
         storage_capacities: &LinkStorageCapacities,
+        feedback: Arc<crate::simulation::pt::feedback::TransitCapacityFeedbackCollector>,
     ) -> Vec<MobsimInput> {
         let num_parts = self.core.config.partitioning().num_parts;
         let population = std::mem::take(&mut self.population);
@@ -357,7 +358,12 @@ impl ControllerScenario {
             .into_iter()
             .enumerate()
             .map(|(rank, population)| {
-                self.create_mobsim_input(rank as u32, population, storage_capacities)
+                self.create_mobsim_input(
+                    rank as u32,
+                    population,
+                    storage_capacities,
+                    feedback.clone(),
+                )
             })
             .collect()
     }
@@ -388,9 +394,10 @@ impl ControllerScenario {
         rank: u32,
         population: Population,
         storage_capacities: &LinkStorageCapacities,
+        feedback: Arc<crate::simulation::pt::feedback::TransitCapacityFeedbackCollector>,
     ) -> MobsimInput {
         let network_partition =
-            Self::create_network_partition(&self.core, storage_capacities, rank);
+            Self::create_network_partition(&self.core, storage_capacities, rank, feedback);
 
         info!(
             "Partition #{rank} network has: {} nodes and {} links. Population has {} agents",
@@ -414,13 +421,15 @@ impl ControllerScenario {
         core: &ScenarioCore,
         storage_capacities: &LinkStorageCapacities,
         rank: u32,
+        feedback: Arc<crate::simulation::pt::feedback::TransitCapacityFeedbackCollector>,
     ) -> SimNetworkPartition {
-        SimNetworkPartition::from_network(
+        SimNetworkPartition::from_network_with_feedback(
             &core.network,
             storage_capacities,
             rank,
             &core.config,
             &core.signals,
+            feedback,
         )
     }
 }
@@ -533,7 +542,7 @@ mod tests {
         }
         .into();
 
-        let inputs = scenario.split_for_mobsim(&storage_capacities);
+        let inputs = scenario.split_for_mobsim(&storage_capacities, Arc::default());
 
         assert!(scenario.population.persons.is_empty());
 

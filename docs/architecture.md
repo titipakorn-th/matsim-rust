@@ -84,6 +84,13 @@ The shared router reads the snapshot without taking the submission lock; unobser
 iteration-reset hooks clear the collectors before the next Mobsim. No event-file output is required for travel-time
 collection.
 
+Transit vehicle stop handling records segment occupancy and compatible passengers denied by a full vehicle in one
+shared, ordered collector. After all workers return, the controller drains that collector and atomically publishes a
+complete immutable snapshot before replanning. Transit routing adds the observed occupancy fraction times segment ride
+time and the observed failed-boarding fraction times the next scheduled headway to predicted cost. These costs affect
+route choice only; vehicle capacity remains an execution constraint in the next Mobsim. Collection does not write
+events.
+
 Worker extensions can observe state moving between partitions through a fourth, thread-local
 `PartitionChangeExtensionsManager` bus alongside the simulation-event, Mobsim-lifecycle, and partition-event buses.
 When a vehicle or teleporting agent leaves a partition, the bus moves one typed attachment slot per registered

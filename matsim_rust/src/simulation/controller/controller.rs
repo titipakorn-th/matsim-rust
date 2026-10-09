@@ -14,6 +14,7 @@ use crate::simulation::network::LinkStorageCapacities;
 use crate::simulation::population::agent_source::{
     DynAgentSource, IntoDynAgentSource, PopulationAgentSource,
 };
+use crate::simulation::pt::feedback::{TransitSegment, TransitSegmentObservation};
 use crate::simulation::replanning::ReplanningStrategy;
 use crate::simulation::replanning::routing::a_star::{AStar, AltHeuristic};
 use crate::simulation::replanning::routing::cost::ScoringBasedTravelTimeAndDisutility;
@@ -30,6 +31,7 @@ use crate::simulation::scenario::{ControllerScenario, Scenario};
 use crate::simulation::scoring;
 use crate::simulation::scoring::{PersonExperiences, PlanScorer};
 use crate::simulation::{id, io};
+use arc_swap::ArcSwap;
 use derive_more::Debug;
 use fs_extra::dir::CopyOptions;
 use itertools::Itertools;
@@ -65,6 +67,9 @@ pub struct Controller {
     #[debug(skip)]
     replanning_strategies: Vec<Box<dyn ReplanningStrategy>>,
     person_demographics: Vec<crate::simulation::analysis::PersonDemographic>,
+    transit_capacity_feedback:
+        Arc<crate::simulation::pt::feedback::TransitCapacityFeedbackCollector>,
+    transit_capacity_snapshot: Arc<ArcSwap<BTreeMap<TransitSegment, TransitSegmentObservation>>>,
 }
 
 pub struct ControllerBuilder {
@@ -219,6 +224,8 @@ impl ControllerBuilder {
         );
         let scenario: ControllerScenario = self.scenario.into();
         let config = scenario.core.config.clone();
+        let transit_capacity_feedback = Arc::new(Default::default());
+        let transit_capacity_snapshot = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
 
         let (worker_registrations, controller_registration, experienced_plans) =
             scoring::create_registrations(&scenario);
@@ -235,7 +242,12 @@ impl ControllerBuilder {
             Duration::from_secs(u64::from(config.travel_time_calculator().bin_size)),
             Duration::from_secs(u64::from(config.qsim().end_time)),
         ));
-        let router = Self::create_trip_router(config.as_ref(), &scenario, global_ttc.clone())?;
+        let router = Self::create_trip_router(
+            config.as_ref(),
+            &scenario,
+            global_ttc.clone(),
+            transit_capacity_snapshot.clone(),
+        )?;
 
         for i in 0..num_parts {
             let net = scenario.core.network.clone();
@@ -275,6 +287,8 @@ impl ControllerBuilder {
             scoring_function: self.scoring_function,
             replanning_strategies: self.replanning_strategies,
             person_demographics: Vec::new(),
+            transit_capacity_feedback,
+            transit_capacity_snapshot,
         })
     }
 
@@ -329,6 +343,9 @@ impl ControllerBuilder {
         config: &Config,
         controller_scenario: &ControllerScenario,
         global_ttc: Arc<GlobalTravelTimeCalculator>,
+        transit_capacity_snapshot: Arc<
+            ArcSwap<BTreeMap<TransitSegment, TransitSegmentObservation>>,
+        >,
     ) -> Result<TripRouter, String> {
         let mut routers: IntMap<Id<String>, Arc<dyn RoutingModule>> = IntMap::default();
 
@@ -403,6 +420,7 @@ impl ControllerBuilder {
                 car_fallback,
                 config.transit().transfer_construction,
             )
+            .with_capacity_feedback_snapshot(transit_capacity_snapshot)
             .with_personless_fallback(config.transit().personless_car_fallback)
             .with_passenger_mode_mapping(
                 config.transit().use_mode_mapping_for_passengers,
@@ -714,10 +732,14 @@ impl Controller {
                 &self.config.output().analysis,
             );
         }
-        let inputs = self
-            .scenario
-            .split_for_mobsim(&self.link_storage_capacities);
+        let inputs = self.scenario.split_for_mobsim(
+            &self.link_storage_capacities,
+            self.transit_capacity_feedback.clone(),
+        );
         let agents = mobsim_workers.run_mobsim(iteration, is_last_iteration, inputs);
+
+        self.transit_capacity_snapshot
+            .store(Arc::new(self.transit_capacity_feedback.take()));
 
         self.controller_events_manager
             .process_event(ControllerEvent::after_mobsim(is_last_iteration));
