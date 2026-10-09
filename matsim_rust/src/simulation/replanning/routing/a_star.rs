@@ -1,7 +1,7 @@
 use crate::simulation::id::Id;
 use crate::simulation::replanning::routing::a_star_core::{
     AStarCoreResult, AStarRequestBuilder, CandidateRoute, HeuristicMode, RoutingAStarActions,
-    a_star_core,
+    SearchBuffers, a_star_core,
 };
 use crate::simulation::replanning::routing::alt_landmark_data::AltLandmarkData;
 use crate::simulation::replanning::routing::cost::{
@@ -17,6 +17,7 @@ use crate::simulation::replanning::routing::network_converter::{
 use crate::simulation::scenario::network::{Link, Network, Node};
 use nohash_hasher::IntMap;
 use ordered_float::OrderedFloat;
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::mem::size_of;
@@ -327,7 +328,7 @@ impl<H: AStarHeuristic> AStar<H> {
         &self,
         to_link: Id<Link>,
         from_link: Id<Link>,
-        parent_links: HashMap<usize, LinkIndex>,
+        parent_links: &[Option<LinkIndex>],
     ) -> Result<Option<Vec<Id<Link>>>, GraphError> {
         // convert given "to" link id to node id, by looking for the start node of the link
         let to_node_id = self.graph.get_start_node(to_link.clone())?;
@@ -336,7 +337,7 @@ impl<H: AStarHeuristic> AStar<H> {
         let mut link_path = Vec::new();
         let mut current_node = to_node_idx;
 
-        while let Some(parent_link) = parent_links.get(&current_node).copied() {
+        while let Some(parent_link) = parent_links[current_node] {
             // while a parent link exists, add the link id to the link path
             link_path.push(self.graph.get_link_id_from_idx(parent_link)?);
             // and set the start node of that link as current node
@@ -513,6 +514,33 @@ impl<H: AStarHeuristic> AStar<H> {
 
 impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
     fn calc_least_cost_path(&self, request: LeastCostPathRequest) -> Option<LeastCostPath> {
+        // Replanning runs on long-lived rayon threads, so the search buffers outlive requests and
+        // iterations instead of being allocated in the size of the network per request. Routers of
+        // different modes share them, which is fine since `SearchBuffers::prepare` resets them and
+        // grows them as needed at the start of each search.
+        SEARCH_BUFFERS.with(|cell| match cell.try_borrow_mut() {
+            Ok(mut buffers) => self.calc_with_buffers(request, &mut buffers),
+            // The buffers are borrowed by an outer search on this thread, e.g. if a cost function
+            // uses rayon and work stealing runs another routing task here. Fall back to fresh
+            // buffers, which costs O(N) for this search instead of panicking.
+            Err(_) => self.calc_with_buffers(request, &mut SearchBuffers::default()),
+        })
+    }
+}
+
+thread_local! {
+    /// Search buffers of all A* routers on this thread, see
+    /// [`AStar::calc_least_cost_path`].
+    static SEARCH_BUFFERS: RefCell<SearchBuffers> = RefCell::new(SearchBuffers::default());
+}
+
+impl<H: AStarHeuristic> AStar<H> {
+    /// Calculates the least cost path for the given request, using the given search buffers.
+    fn calc_with_buffers(
+        &self,
+        request: LeastCostPathRequest,
+        buffers: &mut SearchBuffers,
+    ) -> Option<LeastCostPath> {
         let route_cache_key = if *ROUTE_CACHE_ENABLED {
             self.travel_time
                 .cache_epoch()
@@ -580,6 +608,9 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
         // convert to-node id to node index
         let to_node_idx = self.graph.get_node_idx_from_id(to_node_id);
 
+        // reset the entries written by the previous search on this thread
+        buffers.prepare(self.graph.num_nodes());
+
         // create request for a_star_core
         let a_star_request = match AStarRequestBuilder::default()
             // copies from, departure time, person, vehicle values from the lcp request.
@@ -597,6 +628,7 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
                         to_node_idx,
                         self.travel_time.as_ref(),
                         self.travel_disutility.as_ref(),
+                        &mut buffers.routing,
                     ))
                     .build()
                     .unwrap()
@@ -672,6 +704,7 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
             let _entered = search_span.enter();
             a_star_core(
                 a_star_request,
+                &mut buffers.core,
                 (!search_span.is_disabled()).then_some(&mut nodes_expanded),
                 candidate,
             )
@@ -680,7 +713,7 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
         let mut candidate_bound_used = false;
         let (optimal_disutility, associated_travel_time, searched_path) = match a_star_result {
             // Standard case: A* returned a valid result.
-            Ok(AStarCoreResult::SingleDisutilWithParents(distance, time, parent_links)) => {
+            Ok(AStarCoreResult::SingleDisutil(distance, time)) => {
                 // if the returned distance to the target is infinity or NaN, it is unreachable, so
                 // we return None
                 if distance == f64::INFINITY || distance.is_nan() {
@@ -690,11 +723,12 @@ impl<H: AStarHeuristic> LeastCostPathCalculator for AStar<H> {
                     );
                     return None;
                 }
-                // else, we take the found shortest "distance" as the optimal disutility
+                // else, we take the found shortest "distance" as the optimal disutility. The
+                // parent links are in the routing buffers.
                 let link_path = match self.extract_link_path(
                     request.to.clone(),
                     request.from.clone(),
-                    parent_links,
+                    &buffers.routing.parent_links,
                 ) {
                     Ok(Some(link_path)) => link_path,
                     Ok(None) => {
