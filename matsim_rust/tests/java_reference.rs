@@ -161,6 +161,7 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     config.partitioning_mut().num_parts = num_parts;
     config.output_mut().output_dir =
         Path::new("./test_output/simulation").join(format!("pt_timetable_mixed_{num_parts}_parts"));
+    config.output_mut().analysis.enabled = true;
     let output_dir = config.output().output_dir.clone();
     let reference = read_reference("timetable_mixed");
     verify_same_conditions(&reference, &config);
@@ -291,6 +292,122 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     assert!(
         rust.iter()
             .any(|event| event["type"] == "stuckAndAbort" && event["person"] == "stranded-at-end")
+    );
+
+    // The Java event comparison above validates each passenger ride before checking these
+    // individual trip and complete-journey report rows.
+    let report = output_dir.join("analysis");
+    let trips = std::fs::read_to_string(report.join("transit_trips.csv")).unwrap();
+    assert_eq!(trips.matches("train-to-bus-transfer").count(), 2, "{trips}");
+    let mut vehicle_lines = std::collections::BTreeMap::new();
+    let mut passenger_waits = std::collections::BTreeMap::new();
+    let mut passenger_ride_lines = std::collections::BTreeMap::new();
+    let mut java_stop_counts =
+        std::collections::BTreeMap::<(u64, String, String), (u64, u64)>::new();
+    for event in &reference.events {
+        match event["type"].as_str() {
+            Some("TransitDriverStarts") => {
+                vehicle_lines.insert(
+                    event["vehicleId"].as_str().unwrap().to_owned(),
+                    event["transitLineId"].as_str().unwrap().to_owned(),
+                );
+            }
+            Some("waitingForPt") => {
+                let person = event["person"].as_str().unwrap();
+                if !person.starts_with("pt_") {
+                    passenger_waits.insert(
+                        person.to_owned(),
+                        (
+                            event["atStop"].as_str().unwrap().to_owned(),
+                            event["destinationStop"].as_str().unwrap().to_owned(),
+                        ),
+                    );
+                }
+            }
+            Some(
+                kind @ ("PersonEntersVehicle"
+                | "PersonLeavesVehicle"
+                | "PersonEntersPtVehicle"
+                | "PersonLeavesPtVehicle"),
+            ) => {
+                let person = event["person"].as_str().unwrap();
+                if person.starts_with("pt_") {
+                    continue;
+                }
+                let vehicle = event["vehicle"].as_str().unwrap();
+                let line = vehicle_lines.get(vehicle).unwrap().clone();
+                let (boarding_stop, _) = passenger_waits.get(person).unwrap();
+                if kind == "PersonEntersVehicle" || kind == "PersonEntersPtVehicle" {
+                    java_stop_counts
+                        .entry((
+                            (event["time"].as_f64().unwrap() as u64) / 3600 * 3600,
+                            line.clone(),
+                            boarding_stop.clone(),
+                        ))
+                        .or_default()
+                        .0 += 1;
+                    passenger_ride_lines.insert(person.to_owned(), line);
+                }
+            }
+            Some("arrival") if event["legMode"] == "pt" => {
+                let person = event["person"].as_str().unwrap();
+                if !person.starts_with("pt_") {
+                    // The report bins alightings at passenger arrival, not vehicle leave time.
+                    let line = passenger_ride_lines.remove(person).unwrap();
+                    let (_, alighting_stop) = passenger_waits.get(person).unwrap();
+                    java_stop_counts
+                        .entry((
+                            (event["time"].as_f64().unwrap() as u64) / 3600 * 3600,
+                            line,
+                            alighting_stop.clone(),
+                        ))
+                        .or_default()
+                        .1 += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut stop_counts = csv::Reader::from_path(report.join("transit_stop_hourly.csv")).unwrap();
+    let mut rust_stop_counts = std::collections::BTreeMap::new();
+    for row in stop_counts.records() {
+        let row = row.unwrap();
+        rust_stop_counts.insert(
+            (
+                row[0].parse::<u64>().unwrap(),
+                row[1].to_owned(),
+                row[2].to_owned(),
+            ),
+            (
+                row[3].parse::<u64>().unwrap(),
+                row[4].parse::<u64>().unwrap(),
+            ),
+        );
+    }
+    assert_eq!(rust_stop_counts, java_stop_counts);
+    for (person, vehicle) in [
+        ("capacity-a", "train-0800"),
+        ("capacity-b", "train-0750"),
+        ("train-to-bus-transfer", "train-0730"),
+        ("train-to-bus-transfer", "bus-0740"),
+    ] {
+        assert!(
+            trips.lines().any(|line| {
+                line.starts_with(&format!("\"{person}\""))
+                    && line.contains(&format!("\"{vehicle}\""))
+                    && line.contains(",boarded,")
+            }),
+            "missing report row for {person} on {vehicle}: {trips}"
+        );
+    }
+    let journeys = std::fs::read_to_string(report.join("transit_journeys.csv")).unwrap();
+    assert!(
+        journeys.lines().any(|line| {
+            line.starts_with("\"train-to-bus-transfer\",0,")
+                && line.contains(",2,1,")
+                && line.ends_with(",complete")
+        }),
+        "{journeys}"
     );
 }
 
@@ -1506,13 +1623,21 @@ fn a_distinct_platform_transfer_matches_the_pinned_reference() {
 /// A plan routed through separate platforms completes its walk and transit legs in QSim.
 #[deterministic_id_test(matsim_rust)]
 fn a_distinct_platform_transfer_executes_through_the_simulation_runner() {
-    let config = Config::from_args(CommandLineArgs::new_with_path(
-        "./tests/resources/pt_reference/routing_distinct_platform_transfer/execution.yml",
-    ));
-    let output_dir = config.output().output_dir.clone();
-    run(config);
+    let run_transfer = |num_parts, output_name: &str| {
+        let mut config = Config::from_args(CommandLineArgs::new_with_path(
+            "./tests/resources/pt_reference/routing_distinct_platform_transfer/execution.yml",
+        ));
+        config.partitioning_mut().num_parts = num_parts;
+        config.output_mut().analysis.enabled = true;
+        config.output_mut().output_dir = Path::new("./test_output/simulation").join(output_name);
+        let output_dir = config.output().output_dir.clone();
+        run(config);
+        output_dir
+    };
+    let one_part = run_transfer(1, "pt_distinct_platform_execution_one_part");
+    let two_parts = run_transfer(2, "pt_distinct_platform_execution_two_parts");
 
-    let events = normalize_events(&output_dir.join("events/events.0.binpb"));
+    let events = normalize_events(&one_part.join("events/events.0.binpb"));
     let passenger_events: Vec<_> = events
         .iter()
         .filter(|event| event["person"] == "transfer-person")
@@ -1547,6 +1672,59 @@ fn a_distinct_platform_transfer_executes_through_the_simulation_runner() {
             .iter()
             .any(|event| { event["type"] == ActivityStartEvent::TYPE && event["actType"] == "w" })
     );
+
+    let report_tables = [
+        "transit_trips.csv",
+        "transit_stop_hourly.csv",
+        "transit_journeys.csv",
+        "transit_availability.csv",
+    ];
+    for table in report_tables {
+        let single = std::fs::read(one_part.join("analysis").join(table)).unwrap();
+        let partitioned = std::fs::read(two_parts.join("analysis").join(table)).unwrap();
+        assert_eq!(single, partitioned, "{table} differs across partitions");
+    }
+
+    let trips = std::fs::read_to_string(one_part.join("analysis/transit_trips.csv")).unwrap();
+    assert_eq!(trips.matches("transfer-person").count(), 2, "{trips}");
+    assert!(trips.contains("\"a_to_b\""), "{trips}");
+    assert!(trips.contains("\"b_to_c_bus\""), "{trips}");
+    let mut journeys =
+        csv::Reader::from_path(one_part.join("analysis/transit_journeys.csv")).unwrap();
+    let journey = journeys
+        .records()
+        .map(Result::unwrap)
+        .find(|row| row.get(0) == Some("transfer-person"))
+        .unwrap();
+    assert_eq!(journey.get(5), Some("2"));
+    assert_eq!(journey.get(6), Some("1"));
+    for (index, expected) in [(8, 0.0), (10, 1.0), (11, 156.0), (12, 5.0), (13, 895.0)] {
+        assert_eq!(journey[index].parse::<f64>().unwrap(), expected);
+    }
+    assert_eq!(journey.get(14), Some("complete"));
+    let mut stop_counts =
+        csv::Reader::from_path(one_part.join("analysis/transit_stop_hourly.csv")).unwrap();
+    let mut stops = std::collections::BTreeMap::new();
+    for row in stop_counts.records() {
+        let row = row.unwrap();
+        stops.insert(
+            row[2].to_owned(),
+            (
+                row[3].parse::<u64>().unwrap(),
+                row[4].parse::<u64>().unwrap(),
+                row[5].parse::<f64>().unwrap(),
+                row[6].parse::<f64>().unwrap(),
+            ),
+        );
+    }
+    assert_eq!(stops.get("ra"), Some(&(1, 0, 1.0, 0.0)));
+    assert_eq!(stops.get("rb"), Some(&(0, 1, 0.0, 1.0)));
+    assert_eq!(stops.get("rb_platform"), Some(&(1, 0, 1.0, 0.0)));
+    assert_eq!(stops.get("rc"), Some(&(0, 1, 0.0, 1.0)));
+    let availability =
+        std::fs::read_to_string(one_part.join("analysis/transit_availability.csv")).unwrap();
+    assert!(availability.contains("\"access_egress_transfers\",available,"));
+    assert!(availability.contains("\"physical_service\",unavailable,"));
 }
 
 /// Runs one simulation and returns the router its controller built, so both boundaries the fixtures
