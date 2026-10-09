@@ -133,13 +133,20 @@ impl AStarHeuristic for AltHeuristic {
 
         result
     }
-    /// The landmark bound never overestimates, but its consistency is not established here. The
-    /// maximum over landmarks of the two distance differences is admissible by the triangle
-    /// inequality, while consistency additionally needs the bound to move by at most the edge cost
-    /// along every edge of this directed graph. Candidate bounds and shared destination guidance
-    /// rely on that stronger property, because this search settles nodes without reopening them and
-    /// compares the bound against popped priorities. ALT therefore declines the capability and
-    /// those paths stay limited to heuristics that can state the property.
+    /// The landmark bound never overestimates, but it is not consistent: the maximum over
+    /// landmarks of the two distance differences can move by more than the edge cost between
+    /// neighbouring nodes. Consistency additionally needs the bound to move by at most the edge
+    /// cost along every edge of this directed graph. Candidate bounds and shared destination
+    /// guidance rely on that stronger property, because they compare the bound against popped
+    /// priorities, so ALT declines the capability and those paths stay limited to heuristics that
+    /// can state the property. See
+    /// `test_alt_heuristic_is_inconsistent_on_network_with_one_way_links`.
+    ///
+    /// The inconsistency does cost correctness in general: with nodes settled and never reopened,
+    /// an inconsistent bound may stop on a costlier route. That has not been observed on the
+    /// networks in the test suite, see
+    /// `test_alt_routes_match_dijkstra_on_network_with_one_way_links`, but it is not ruled out
+    /// either.
     fn supports_consistent_static_bounds(&self) -> bool {
         false
     }
@@ -1490,6 +1497,86 @@ mod tests {
         }
     }
 
+    /// The landmark bound must move by at most the edge cost along every edge to be consistent,
+    /// i.e. h(S,T) <= c(S,U) + h(U,T) for every edge S->U. Candidate bounds and shared destination
+    /// guidance compare the bound against popped priorities, so they rely on this holding.
+    ///
+    /// The bound is admissible but not consistent: the two forms over a landmark are lower bounds
+    /// on the shortest path, yet their maximum can jump by more than one edge cost between
+    /// neighbouring nodes. This test pins that down on a network with one-way links, so that
+    /// flipping `supports_consistent_static_bounds` to true has to revisit the exactness claim.
+    #[deterministic_id_test]
+    fn test_alt_heuristic_is_inconsistent_on_network_with_one_way_links() {
+        let network = Arc::new(Network::from_file(
+            "./assets/andorra-network.xml.gz",
+            1,
+            &PartitionMethod::Metis(MetisOptions::default()),
+        ));
+        let cost = FreeOrMaxSpeedTravelTimeAndDisutility;
+        let graph = convert_network_for_mode(network, None);
+        let heuristic = AltHeuristic::from_graph(&graph, &cost).unwrap();
+
+        let num_nodes = <dyn IndexableGraph>::num_nodes(&graph);
+        let mut checks: u64 = 0;
+        let mut violations: u64 = 0;
+        let mut worst = 0.0_f64;
+        let mut example = None;
+
+        let mut rng_state: u64 = 0x243F6A8885A308D3;
+        let mut next = move || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state % 100_000
+        };
+
+        for _ in 0..400_000 {
+            let s = next() as usize % num_nodes;
+            let t = next() as usize % num_nodes;
+            let u = next() as usize % num_nodes;
+            // edge S -> U must exist
+            let edge_cost = graph.outgoing_edges_as_idx(s).iter().find_map(|&e| {
+                if graph.get_end_node_as_idx(e).ok()? != u {
+                    return None;
+                }
+                Some(cost.travel_disutility(
+                    graph.get_link_from_idx(e).ok()?,
+                    SimTime::default(),
+                    None,
+                    None,
+                ))
+            });
+            let Some(edge_cost) = edge_cost else {
+                continue;
+            };
+            if !edge_cost.is_finite() || edge_cost < 0.0 {
+                continue;
+            }
+
+            let s_id = graph.get_node_id_from_idx(s).unwrap();
+            let t_id = graph.get_node_id_from_idx(t).unwrap();
+            let u_id = graph.get_node_id_from_idx(u).unwrap();
+
+            let h_st = heuristic.estimate(s_id.clone(), t_id.clone());
+            let h_ut = heuristic.estimate(u_id.clone(), t_id);
+            checks += 1;
+            if h_st > edge_cost + h_ut + 1e-9 {
+                violations += 1;
+                let excess = h_st - edge_cost - h_ut;
+                if excess > worst {
+                    worst = excess;
+                    example = Some((s_id, u_id, h_st, edge_cost, h_ut, excess));
+                }
+            }
+        }
+
+        assert!(checks > 0, "the sample must include at least one edge");
+        assert!(
+            violations > 0,
+            "expected an inconsistent ALT bound; checked {checks} edges, worst excess {worst:.6}, example {example:?}"
+        );
+    }
+
     #[deterministic_id_test]
     fn alt_heuristic_declines_consistent_static_bounds() {
         // Candidate bounds and shared reverse guidance rely on a consistent heuristic, which the
@@ -1706,6 +1793,69 @@ mod tests {
             // In all cases, should return none
             assert!(result.is_none());
         }
+    }
+
+    /// ALT routes must cost what Dijkstra costs, on a network with one-way links. The landmark bound
+    /// is admissible but inconsistent, and this search settles nodes without reopening them, so
+    /// this is the property that would break first if either changed. Dijkstra is the reference,
+    /// since without a heuristic it settles nothing early.
+    #[deterministic_id_test]
+    fn test_alt_routes_match_dijkstra_on_network_with_one_way_links() {
+        let network = Arc::new(Network::from_file(
+            "./assets/andorra-network.xml.gz",
+            1,
+            &PartitionMethod::Metis(MetisOptions::default()),
+        ));
+        // Deterministic pairs spread over the car links, so both routers see the same requests.
+        let car = Id::<String>::get_from_ext("car");
+        let mut links: Vec<Id<Link>> = network
+            .links()
+            .iter()
+            .filter(|l| l.modes.contains(&car))
+            .map(|l| l.id.clone())
+            .collect();
+        links.sort();
+
+        let cost = Arc::new(FreeOrMaxSpeedTravelTimeAndDisutility);
+        let alt = Alt::new(network.clone(), None, cost.clone(), cost.clone()).unwrap();
+        let dijkstra = Dijkstra::new(network, None, cost.clone(), cost).unwrap();
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 1_000_003) as usize
+        };
+
+        let mut compared = 0;
+        for _ in 0..2_000 {
+            let from = links[next() % links.len()].clone();
+            let to = links[next() % links.len()].clone();
+            let request = || {
+                LeastCostPathRequestBuilder::default()
+                    .from(from.clone())
+                    .to(to.clone())
+                    .build()
+                    .unwrap()
+            };
+            let (Some(alt_path), Some(dijkstra_path)) = (
+                alt.calc_least_cost_path(request()),
+                dijkstra.calc_least_cost_path(request()),
+            ) else {
+                continue;
+            };
+            compared += 1;
+            assert!(
+                alt_path.travel_disutility <= dijkstra_path.travel_disutility + 1e-9,
+                "ALT route from {} to {} costs {} but Dijkstra costs {}",
+                from,
+                to,
+                alt_path.travel_disutility,
+                dijkstra_path.travel_disutility
+            );
+            assert_eq!(alt_path.travel_time, dijkstra_path.travel_time);
+        }
+        assert!(compared > 1_900, "expected most pairs to be reachable");
     }
 
     /// The ALT bound must never overestimate, on a network with one-way links. Covers every
