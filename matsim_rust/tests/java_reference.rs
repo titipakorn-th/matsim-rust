@@ -1618,13 +1618,21 @@ fn a_distinct_platform_transfer_matches_the_pinned_reference() {
 /// A plan routed through separate platforms completes its walk and transit legs in QSim.
 #[deterministic_id_test(matsim_rust)]
 fn a_distinct_platform_transfer_executes_through_the_simulation_runner() {
-    let config = Config::from_args(CommandLineArgs::new_with_path(
-        "./tests/resources/pt_reference/routing_distinct_platform_transfer/execution.yml",
-    ));
-    let output_dir = config.output().output_dir.clone();
-    run(config);
+    let run_transfer = |num_parts, output_name: &str| {
+        let mut config = Config::from_args(CommandLineArgs::new_with_path(
+            "./tests/resources/pt_reference/routing_distinct_platform_transfer/execution.yml",
+        ));
+        config.partitioning_mut().num_parts = num_parts;
+        config.output_mut().analysis.enabled = true;
+        config.output_mut().output_dir = Path::new("./test_output/simulation").join(output_name);
+        let output_dir = config.output().output_dir.clone();
+        run(config);
+        output_dir
+    };
+    let one_part = run_transfer(1, "pt_distinct_platform_execution_one_part");
+    let two_parts = run_transfer(2, "pt_distinct_platform_execution_two_parts");
 
-    let events = normalize_events(&output_dir.join("events/events.0.binpb"));
+    let events = normalize_events(&one_part.join("events/events.0.binpb"));
     let passenger_events: Vec<_> = events
         .iter()
         .filter(|event| event["person"] == "transfer-person")
@@ -1659,6 +1667,59 @@ fn a_distinct_platform_transfer_executes_through_the_simulation_runner() {
             .iter()
             .any(|event| { event["type"] == ActivityStartEvent::TYPE && event["actType"] == "w" })
     );
+
+    let report_tables = [
+        "transit_trips.csv",
+        "transit_stop_hourly.csv",
+        "transit_journeys.csv",
+        "transit_availability.csv",
+    ];
+    for table in report_tables {
+        let single = std::fs::read(one_part.join("analysis").join(table)).unwrap();
+        let partitioned = std::fs::read(two_parts.join("analysis").join(table)).unwrap();
+        assert_eq!(single, partitioned, "{table} differs across partitions");
+    }
+
+    let trips = std::fs::read_to_string(one_part.join("analysis/transit_trips.csv")).unwrap();
+    assert_eq!(trips.matches("transfer-person").count(), 2, "{trips}");
+    assert!(trips.contains("\"a_to_b\""), "{trips}");
+    assert!(trips.contains("\"b_to_c_bus\""), "{trips}");
+    let mut journeys =
+        csv::Reader::from_path(one_part.join("analysis/transit_journeys.csv")).unwrap();
+    let journey = journeys
+        .records()
+        .map(Result::unwrap)
+        .find(|row| row.get(0) == Some("transfer-person"))
+        .unwrap();
+    assert_eq!(journey[5], "2");
+    assert_eq!(journey[6], "1");
+    for (index, expected) in [(8, 0.0), (10, 0.0), (11, 156.0), (12, 5.0), (13, 900.0)] {
+        assert_eq!(journey[index].parse::<f64>().unwrap(), expected);
+    }
+    assert_eq!(journey[14], "complete");
+    let mut stop_counts =
+        csv::Reader::from_path(one_part.join("analysis/transit_stop_hourly.csv")).unwrap();
+    let mut stops = std::collections::BTreeMap::new();
+    for row in stop_counts.records() {
+        let row = row.unwrap();
+        stops.insert(
+            row[2].to_owned(),
+            (
+                row[3].parse::<u64>().unwrap(),
+                row[4].parse::<u64>().unwrap(),
+                row[5].parse::<f64>().unwrap(),
+                row[6].parse::<f64>().unwrap(),
+            ),
+        );
+    }
+    assert_eq!(stops.get("ra"), Some(&(1, 0, 1.0, 0.0)));
+    assert_eq!(stops.get("rb"), Some(&(0, 1, 0.0, 1.0)));
+    assert_eq!(stops.get("rb_platform"), Some(&(1, 0, 1.0, 0.0)));
+    assert_eq!(stops.get("rc"), Some(&(0, 1, 0.0, 1.0)));
+    let availability =
+        std::fs::read_to_string(one_part.join("analysis/transit_availability.csv")).unwrap();
+    assert!(availability.contains("\"access_egress_transfers\",available,"));
+    assert!(availability.contains("\"physical_service\",unavailable,"));
 }
 
 /// Runs one simulation and returns the router its controller built, so both boundaries the fixtures
