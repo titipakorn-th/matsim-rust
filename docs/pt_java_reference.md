@@ -140,6 +140,10 @@ outside its coverage.
 The fixture records MATSim's `totalRouteCost` attribute in utility units. The Rust assertion converts
 its time-equivalent cost using the pinned PT time weight before comparing the two.
 
+### `capacity_feedback`
+
+Two passengers compete for one seat on the 08:00 direct service. A second direct departure leaves at 08:30, while separate riders use the 08:05–08:20 transfer. After two iterations, the request at 08:00:01 selects the transfer in both implementations. MATSim enables SwissRailRaptor's capacity constraint; Rust uses the occupancy and failed-boarding feedback collected during the first iteration. This compares the resulting itinerary, not the internal capacity algorithms, which differ as described in [the architecture notes](architecture.md).
+
 ### `routing_mapped_modes`
 
 The same request and schedule with the `b_to_c` route changed to `bus`. Both configs enable

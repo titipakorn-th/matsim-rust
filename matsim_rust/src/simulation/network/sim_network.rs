@@ -23,6 +23,7 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -134,6 +135,24 @@ impl SimNetworkPartition {
         config: &config::Config,
         signals: &Signals,
     ) -> Self {
+        Self::from_network_with_feedback(
+            global_network,
+            storage_capacities,
+            partition,
+            config,
+            signals,
+            Arc::default(),
+        )
+    }
+
+    pub(crate) fn from_network_with_feedback(
+        global_network: &Network,
+        storage_capacities: &LinkStorageCapacities,
+        partition: u32,
+        config: &config::Config,
+        signals: &Signals,
+        feedback: Arc<crate::simulation::pt::feedback::TransitCapacityFeedbackCollector>,
+    ) -> Self {
         let qsim_config = config.qsim();
         let clock = SimClock::new(qsim_config.ticks_per_second);
         let nodes: Vec<&Node> = global_network
@@ -184,6 +203,7 @@ impl SimNetworkPartition {
             clock,
             qsim_config.remove_stuck_vehicles,
             partition_signals,
+            feedback,
         )
     }
 
@@ -271,6 +291,7 @@ impl SimNetworkPartition {
         clock: SimClock,
         remove_stuck_vehicles: bool,
         signals: Signals,
+        feedback: Arc<crate::simulation::pt::feedback::TransitCapacityFeedbackCollector>,
     ) -> Self {
         // Initialize RNG with a seed based on the base seed and node id
         let rng = nodes
@@ -295,7 +316,7 @@ impl SimNetworkPartition {
             remove_stuck_vehicles,
             stuck_agents: Vec::new(),
             signals,
-            transit_stops: TransitStops::default(),
+            transit_stops: TransitStops::with_feedback(feedback),
         }
     }
 

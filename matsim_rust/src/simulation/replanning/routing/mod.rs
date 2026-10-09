@@ -5,6 +5,7 @@ use crate::simulation::config::{
     TransitTransferPenalty,
 };
 use crate::simulation::id::Id;
+use crate::simulation::pt::feedback::{TransitSegment, TransitSegmentObservation};
 use crate::simulation::scenario::Coordinate;
 use crate::simulation::scenario::facilities::ActivityFacility;
 use crate::simulation::scenario::network::{Link, Network};
@@ -12,6 +13,7 @@ use crate::simulation::scenario::population::{
     InternalActivity, InternalGenericRoute, InternalLeg, InternalPerson, InternalPlanElement,
     InternalPtRoute, InternalPtRouteDescription, InternalRoute, Population,
 };
+use crate::simulation::scenario::transit::TransitDeparture;
 use crate::simulation::scenario::transit::{TransitSchedule, TransitStopFacility};
 use crate::simulation::scenario::vehicles::{Garage, InternalVehicle};
 use crate::simulation::time::SimTime;
@@ -480,6 +482,7 @@ pub struct TransitRoutingModule {
     route_selector_settings: Vec<TransitRouteSelectorSettings>,
     transfer_penalty: TransitTransferPenalty,
     random_seed: u64,
+    capacity_feedback: Arc<ArcSwap<BTreeMap<TransitSegment, TransitSegmentObservation>>>,
 }
 
 /// The three numbers MATSim's travel-time cost formula needs: the agent's performing utility, the
@@ -513,6 +516,9 @@ struct RouteStopRef {
 struct Ride {
     line: Id<crate::simulation::scenario::transit::TransitLine>,
     route: Id<crate::simulation::scenario::transit::TransitRoute>,
+    departure: Id<TransitDeparture>,
+    board_index: usize,
+    alight_index: usize,
     board: Id<TransitStopFacility>,
     alight: Id<TransitStopFacility>,
     boarding_time: SimTime,
@@ -818,6 +824,14 @@ impl RoutingModule for TransitRoutingModule {
 }
 
 impl TransitRoutingModule {
+    pub(crate) fn with_capacity_feedback_snapshot(
+        mut self,
+        snapshot: Arc<ArcSwap<BTreeMap<TransitSegment, TransitSegmentObservation>>>,
+    ) -> Self {
+        self.capacity_feedback = snapshot;
+        self
+    }
+
     const CELL_SIZE: f64 = 1_000.0;
     const CANDIDATE_COUNT: usize = 12;
     const WALK_MODE: &'static str = "walk";
@@ -1348,6 +1362,7 @@ impl TransitRoutingModule {
             route_selector_settings: vec![TransitRouteSelectorSettings::default()],
             transfer_penalty: TransitTransferPenalty::default(),
             random_seed: crate::simulation::config::DEFAULT_RANDOM_SEED,
+            capacity_feedback: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
         };
         if transfer_construction == TransferConstruction::Initial {
             let mut cache = router.transfer_cache.write().unwrap();
@@ -1730,8 +1745,13 @@ impl TransitRoutingModule {
     ) -> f64 {
         let base = arrival.duration_since(departure_time).as_secs_f64()
             + self.transfer_penalty_seconds(rides, routing_params);
+        let feedback = self.capacity_feedback.load();
+        let capacity_cost = rides
+            .iter()
+            .map(|ride| self.capacity_feedback_cost_seconds(ride, &feedback))
+            .sum::<f64>();
         if !self.use_passenger_mode_mapping {
-            return base;
+            return base + capacity_cost;
         }
         let baseline =
             routing_params.performing_utility_per_hour - routing_params.pt_utility_per_hour;
@@ -1762,6 +1782,66 @@ impl TransitRoutingModule {
                     * (mode_cost_factor - 1.0)
             })
             .sum::<f64>()
+            + capacity_cost
+    }
+
+    fn capacity_feedback_cost_seconds(
+        &self,
+        ride: &Ride,
+        feedback: &BTreeMap<TransitSegment, TransitSegmentObservation>,
+    ) -> f64 {
+        let line = self.schedule.get_line(&ride.line);
+        let route = &line.routes[&ride.route];
+        let from = ride.board_index;
+        let to = ride.alight_index;
+        if from >= to {
+            return 0.0;
+        }
+
+        let mut penalty = 0.0;
+        for index in from..to {
+            let from_stop = &route.stops[index];
+            let to_stop = &route.stops[index + 1];
+            let segment_seconds = to_stop
+                .arrival_offset
+                .or(to_stop.departure_offset)
+                .unwrap_or_default()
+                .saturating_sub(from_stop.departure_offset.unwrap_or_default())
+                .as_secs_f64();
+            let segment = TransitSegment {
+                line: ride.line.clone(),
+                route: ride.route.clone(),
+                departure: ride.departure.clone(),
+                from: from_stop.facility_id.clone(),
+                to: to_stop.facility_id.clone(),
+            };
+            let Some(observation) = feedback.get(&segment) else {
+                continue;
+            };
+            if observation.capacity > 0 {
+                let occupancy = observation.passengers as f64 / observation.capacity as f64;
+                penalty += segment_seconds * occupancy;
+            }
+            let boarding_attempts = observation
+                .failed_boardings
+                .saturating_add(observation.boarded);
+            if index == from && boarding_attempts > 0 {
+                let boarding_offset = route.stops[from].departure_offset.unwrap_or_default();
+                let headway = route
+                    .departures
+                    .iter()
+                    .filter_map(|departure| {
+                        let next_boarding =
+                            departure.departure_time.saturating_add(boarding_offset);
+                        (next_boarding > ride.boarding_time).then_some(next_boarding)
+                    })
+                    .map(|departure| departure.duration_since(ride.boarding_time).as_secs_f64())
+                    .min_by(f64::total_cmp)
+                    .unwrap_or(0.0);
+                penalty += headway * observation.failed_boardings as f64 / boarding_attempts as f64;
+            }
+        }
+        penalty
     }
 
     /// Transfer penalties for a whole itinerary, priced into the seconds-based cost.
@@ -2227,6 +2307,9 @@ impl TransitRoutingModule {
                             rides.push(Ride {
                                 line: line.id.clone(),
                                 route: route.id.clone(),
+                                departure: departure.id.clone(),
+                                board_index: route_ref.stop_index,
+                                alight_index,
                                 board: boarding_stop.clone(),
                                 alight: alight_stop.facility_id.clone(),
                                 boarding_time,
@@ -2521,8 +2604,8 @@ mod route_proposal_tests {
     use super::{
         Facility, OWNS_CAR, Ride, RouteFrequencyProposalBackend, RouteProposal, RouteProposalKey,
         RouteProposalSeed, RouteProposalTable, RoutingError, RoutingModule, RoutingRequest,
-        RoutingRequestBuilder, TransitRoutingModule, TransitSkimOutcome, TripRouter,
-        matching_transit_settings, transit_path_tiebreak,
+        RoutingRequestBuilder, TransitRoutingModule, TransitSegment, TransitSegmentObservation,
+        TransitSkimOutcome, TripRouter, matching_transit_settings, transit_path_tiebreak,
     };
     use crate::simulation::InternalAttributes;
     use crate::simulation::config::{
@@ -2539,7 +2622,7 @@ mod route_proposal_tests {
         InternalPlanElement, InternalRoute, Population,
     };
     use crate::simulation::scenario::transit::{
-        TransitDeparture, TransitLine, TransitRoute, TransitSchedule,
+        TransitDeparture, TransitLine, TransitRoute, TransitRouteStop, TransitSchedule,
     };
     use crate::simulation::scenario::vehicles::{Garage, InternalVehicle};
     use crate::simulation::time::SimTime;
@@ -2720,6 +2803,9 @@ mod route_proposal_tests {
             |boarding: SimTime, vehicle_arrival_at_board: SimTime, alighting: SimTime| Ride {
                 line: Id::create("line"),
                 route: Id::create("route"),
+                departure: Id::create("departure"),
+                board_index: 0,
+                alight_index: 1,
                 board: Id::create("ra"),
                 alight: Id::create("rc"),
                 boarding_time: boarding,
@@ -3164,6 +3250,152 @@ mod route_proposal_tests {
         assert_eq!(
             router.path_cost(&path, departure),
             Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[deterministic_id_test]
+    fn previous_iteration_crowding_and_failed_boarding_change_the_next_route_choice() {
+        let mut schedule = reference_schedule();
+        let direct = schedule
+            .lines_mut()
+            .get_mut(&Id::<TransitLine>::create("Reference Line"))
+            .unwrap()
+            .routes
+            .get_mut(&Id::<TransitRoute>::create("direct"))
+            .unwrap();
+        direct.stops[1].arrival_offset = Some(Duration::from_secs(5 * 60));
+        direct.departures = [("d_0800", 8 * 3600), ("d_0830", 8 * 3600 + 30 * 60)]
+            .into_iter()
+            .map(|(id, time)| TransitDeparture {
+                id: Id::create(id),
+                departure_time: SimTime::from_secs(time),
+                vehicle_ref_id: None,
+                attributes: InternalAttributes::default(),
+            })
+            .collect();
+
+        let router = reference_router(schedule, 0.8333333333333334);
+        let destination = Coordinate::new_2d(3950.0, 1050.0);
+        let access = [(Id::create("ra"), 0.0)];
+        let egress = HashSet::from([Id::create("rc")]);
+        let departure = SimTime::from_secs(8 * 3600);
+        let params = router.resolve_routing_params("");
+        let baseline = router
+            .find_best_path(&destination, departure, &access, &egress, &params)
+            .unwrap();
+        assert_eq!("direct", baseline.rides[0].route.external());
+        let empty_feedback = router
+            .find_best_path(&destination, departure, &access, &egress, &params)
+            .unwrap();
+        assert_eq!(baseline.rides[0].route, empty_feedback.rides[0].route);
+
+        let segment = TransitSegment {
+            line: Id::create("Reference Line"),
+            route: Id::create("direct"),
+            departure: Id::create("d_0800"),
+            from: Id::create("ra"),
+            to: Id::create("rc"),
+        };
+        let observations =
+            crate::simulation::pt::feedback::TransitCapacityFeedbackCollector::default();
+        observations.record(
+            segment,
+            TransitSegmentObservation {
+                passengers: 1,
+                capacity: 1,
+                boarded: 0,
+                failed_boardings: 1,
+            },
+        );
+        router
+            .capacity_feedback
+            .store(Arc::new(observations.take()));
+        let next_iteration = router
+            .find_best_path(&destination, departure, &access, &egress, &params)
+            .unwrap();
+        assert_eq!(
+            vec!["a_to_b", "b_to_c"],
+            next_iteration
+                .rides
+                .iter()
+                .map(|ride| ride.route.external())
+                .collect::<Vec<_>>()
+        );
+        let repeated = router
+            .find_best_path(&destination, departure, &access, &egress, &params)
+            .unwrap();
+        assert_eq!(
+            next_iteration
+                .rides
+                .iter()
+                .map(|ride| ride.route.external())
+                .collect::<Vec<_>>(),
+            repeated
+                .rides
+                .iter()
+                .map(|ride| ride.route.external())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[deterministic_id_test]
+    fn occupancy_penalty_uses_each_scheduled_segment_duration() {
+        let mut schedule = reference_schedule();
+        schedule
+            .lines_mut()
+            .get_mut(&Id::<TransitLine>::create("Reference Line"))
+            .unwrap()
+            .routes
+            .get_mut(&Id::<TransitRoute>::create("direct"))
+            .unwrap()
+            .stops
+            .insert(
+                1,
+                TransitRouteStop {
+                    facility_id: Id::create("rb"),
+                    arrival_offset: Some(Duration::from_secs(5 * 60)),
+                    departure_offset: Some(Duration::from_secs(10 * 60)),
+                    await_departure: None,
+                    allow_boarding: true,
+                    allow_alighting: true,
+                    minimum_stop_duration: Duration::ZERO,
+                },
+            );
+        let router = reference_router(schedule, 0.8333333333333334);
+        let ride = Ride {
+            line: Id::create("Reference Line"),
+            route: Id::create("direct"),
+            departure: Id::create("d_0800"),
+            board_index: 0,
+            alight_index: 2,
+            board: Id::create("ra"),
+            alight: Id::create("rc"),
+            boarding_time: SimTime::from_secs(8 * 3600),
+            vehicle_arrival_at_board: SimTime::from_secs(8 * 3600),
+            alighting_time: SimTime::from_secs(8 * 3600 + 50 * 60),
+            distance: 0.0,
+            transport_mode: "bus".to_string(),
+            passenger_mode: "pt".to_string(),
+            transfer_before: None,
+        };
+        let crowded_first_segment = BTreeMap::from([(
+            TransitSegment {
+                line: Id::create("Reference Line"),
+                route: Id::create("direct"),
+                departure: Id::create("d_0800"),
+                from: Id::create("ra"),
+                to: Id::create("rb"),
+            },
+            TransitSegmentObservation {
+                passengers: 1,
+                capacity: 1,
+                ..TransitSegmentObservation::default()
+            },
+        )]);
+
+        assert_eq!(
+            5.0 * 60.0,
+            router.capacity_feedback_cost_seconds(&ride, &crowded_first_segment)
         );
     }
 

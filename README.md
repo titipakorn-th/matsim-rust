@@ -30,7 +30,9 @@ Recent upgrades extend the simulation, routing, and analysis workflow:
   transit legs are teleported by default. Transit route searches can also use per-subpopulation
   departure windows and route-choice weights through `transit.range_query_settings` and
   `transit.route_selector_settings`, plus MATSim's base, per-travel-time-hour, bounded and
-  mode-to-mode transfer penalties through `transit.transfer_penalty`.
+  mode-to-mode transfer penalties through `transit.transfer_penalty`. When vehicles are simulated,
+  experienced crowding and capacity-denied boarding affect next-iteration route costs without
+  changing vehicle capacity.
 - Activity facilities support mode-specific link selection. The controller also accepts
   custom scoring functions and replanning strategies.
 - Traffic signals use approach-link green windows. `qsim.remove_stuck_vehicles: true`
