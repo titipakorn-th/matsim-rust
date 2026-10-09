@@ -2,6 +2,7 @@ use crate::simulation::InternalAttributes;
 use crate::simulation::config::{
     IntermodalAccessEgress, IntermodalLegOnlyHandling, IntermodalModeSelection, ModalLinkSelection,
     TransferConstruction, TransitRangeQuerySettings, TransitRouteSelectorSettings,
+    TransitTransferPenalty,
 };
 use crate::simulation::id::Id;
 use crate::simulation::pt::feedback::{TransitSegment, TransitSegmentObservation};
@@ -472,13 +473,35 @@ pub struct TransitRoutingModule {
     leg_only_handling: IntermodalLegOnlyHandling,
     passenger_modes: std::collections::BTreeMap<String, String>,
     use_passenger_mode_mapping: bool,
-    passenger_mode_travel_utilities: std::collections::BTreeMap<String, f64>,
-    performing_utility_per_hour: f64,
-    default_pt_travel_utility_per_hour: f64,
+    /// Resolved per-subpopulation routing parameters, keyed by subpopulation. An empty string
+    /// entry stores the default that applies to every subpopulation without an explicit override.
+    /// Built once from the configured `mode_params` / `agent_params` so each request resolves
+    /// costs with a single `BTreeMap` lookup.
+    routing_params_by_subpopulation: std::collections::BTreeMap<String, ResolvedRoutingParams>,
     range_query_settings: Vec<TransitRangeQuerySettings>,
     route_selector_settings: Vec<TransitRouteSelectorSettings>,
+    transfer_penalty: TransitTransferPenalty,
     random_seed: u64,
     capacity_feedback: Arc<ArcSwap<BTreeMap<TransitSegment, TransitSegmentObservation>>>,
+}
+
+/// The three numbers MATSim's travel-time cost formula needs: the agent's performing utility, the
+/// baseline pt utility, and a per-mode utility map that lets bus and rail legs disagree about how
+/// fast time passes. Reference semantics are intentional: the routing module hands the same
+/// resolved struct to every leg-cost call within one request, so a passenger never pays different
+/// costs for two halves of the same trip.
+#[derive(Clone, Debug)]
+pub struct ResolvedRoutingParams {
+    /// `agent_params[person].performing` for the request's subpopulation, or the config default
+    /// (6.0) when no agent parameter overrides it. Always finite: the controller rejects a config
+    /// whose `performing` is non-finite.
+    pub performing_utility_per_hour: f64,
+    /// `mode_params[pt].marginal_utility_of_traveling` for the request's subpopulation, falling
+    /// back to the empty-subpopulation entry, then -6.0. Always finite by the same controller check.
+    pub pt_utility_per_hour: f64,
+    /// Per-mode marginal utilities of traveling (utils/hour) for the request's subpopulation.
+    /// Resolution order: matching subpopulation, then empty subpopulation, then -6.0 for `pt`.
+    pub mode_utilities: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Clone)]
@@ -499,8 +522,15 @@ struct Ride {
     board: Id<TransitStopFacility>,
     alight: Id<TransitStopFacility>,
     boarding_time: SimTime,
+    /// When the vehicle reached the boarding stop, which is earlier than `boarding_time` by any
+    /// dwell there. MATSim starts the clock it prices a transfer penalty against at
+    /// `max(agent arrival, vehicle arrival)`, so this is needed to reproduce that origin.
+    vehicle_arrival_at_board: SimTime,
     alighting_time: SimTime,
     distance: f64,
+    /// The route's transport mode, which MATSim's mode-to-mode transfer penalties are keyed on.
+    /// Distinct from `passenger_mode`, the mapped mode the leg is reported under.
+    transport_mode: String,
     passenger_mode: String,
     transfer_before: Option<(f64, f64, Duration)>,
 }
@@ -598,15 +628,64 @@ fn matching_transit_settings<'a, T: TransitSubpopulations>(
         })
 }
 
+/// Build a per-subpopulation map of resolved routing parameters from the configured scoring
+/// inputs. Each entry bundles the performing utility for its subpopulation with the matching mode
+/// utilities; a subpopulation absent from the input gets no entry here, so resolution falls back
+/// to the empty-subpopulation entry (the global default) and finally to the built-in constants.
+///
+/// The output is keyed by `subpopulation` (verbatim from the config); empty string is the global
+/// default entry.
+fn build_routing_params_by_subpopulation(
+    mode_params: &[crate::simulation::config::ModeParameter],
+    agent_params: &[crate::simulation::config::AgentParameter],
+) -> std::collections::BTreeMap<String, ResolvedRoutingParams> {
+    let mut mode_by_subpopulation: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, f64>,
+    > = std::collections::BTreeMap::new();
+    for params in mode_params {
+        mode_by_subpopulation
+            .entry(params.subpopulation.clone())
+            .or_default()
+            .insert(params.mode.clone(), params.marginal_utility_of_traveling);
+    }
+    let mut by_subpopulation: std::collections::BTreeMap<String, ResolvedRoutingParams> =
+        std::collections::BTreeMap::new();
+    let subpopulations: std::collections::BTreeSet<String> = mode_by_subpopulation
+        .keys()
+        .cloned()
+        .chain(agent_params.iter().map(|p| p.subpopulation.clone()))
+        .collect();
+    for subpopulation in subpopulations {
+        let mode_utilities = mode_by_subpopulation
+            .get(&subpopulation)
+            .cloned()
+            .unwrap_or_else(|| mode_by_subpopulation.get("").cloned().unwrap_or_default());
+        let pt_utility = mode_utilities.get("pt").copied().unwrap_or(-6.0);
+        // The performing utility is per-subpopulation; an absent agent_params entry for the
+        // requested subpopulation inherits the global default ("person" subpopulation) at
+        // 6.0 utils/hour — the same fallback MATSim uses when no `person` override is set.
+        let performing = agent_params
+            .iter()
+            .find(|params| params.subpopulation == subpopulation)
+            .map_or(6.0, |params| params.performing);
+        by_subpopulation.insert(
+            subpopulation,
+            ResolvedRoutingParams {
+                performing_utility_per_hour: performing,
+                pt_utility_per_hour: pt_utility,
+                mode_utilities,
+            },
+        );
+    }
+    by_subpopulation
+}
+
 // ponytail: This search cap is fixed at 20 until MATSim's configurable transfer limit is ported.
 const RAPTOR_MAX_TRANSFERS: usize = 20;
 const RAPTOR_MIN_TRANSFER_TIME: Duration = Duration::from_secs(60);
 const RAPTOR_TRANSFER_WALK_MARGIN: Duration = Duration::from_secs(5);
 const RAPTOR_MAX_WALK_TRANSFER_DISTANCE: f64 = 200.0;
-// With MATSim's pinned defaults, PT/walk time costs 12 utils per hour and a line switch costs
-// 1 utility, equivalent to 300 seconds of travel time.
-// ponytail: Keep these at pinned Java defaults until configurable RAPTOR scoring is in scope.
-const RAPTOR_TRANSFER_COST: Duration = Duration::from_secs(300);
 
 impl RoutingModule for TransitRoutingModule {
     fn calc_route(
@@ -665,6 +744,11 @@ impl RoutingModule for TransitRoutingModule {
         let subpopulation = request
             .person()
             .map_or("", |person| person.subpopulation().external());
+        // Resolve per-subpopulation routing costs once. The TripRouter builds the itinerary
+        // here and downstream scoring picks up the same passenger mode, so they have to agree
+        // on the cost formula. Resolving once and threading the same struct through every
+        // leg-cost call inside this request is what keeps that agreement exact.
+        let routing_params = self.resolve_routing_params(subpopulation);
         let best = if let Some(settings) =
             matching_transit_settings(&self.range_query_settings, subpopulation)
         {
@@ -675,6 +759,7 @@ impl RoutingModule for TransitRoutingModule {
                 &egress_stops,
                 settings,
                 request.person(),
+                &routing_params,
             )
             .or_else(|| {
                 self.find_best_path_with_feeders(
@@ -682,6 +767,7 @@ impl RoutingModule for TransitRoutingModule {
                     request.departure_time,
                     &access_stops,
                     &egress_stops,
+                    &routing_params,
                 )
             })
         } else {
@@ -690,6 +776,7 @@ impl RoutingModule for TransitRoutingModule {
                 request.departure_time,
                 &access_stops,
                 &egress_stops,
+                &routing_params,
             )
         };
         let Some(path) = best else {
@@ -724,7 +811,7 @@ impl RoutingModule for TransitRoutingModule {
             });
         };
         if direct_walk_time.as_secs_f64()
-            < self.path_cost_equivalent_seconds(&path, request.departure_time)
+            < self.path_cost_equivalent_seconds(&path, request.departure_time, &routing_params)
         {
             return Ok(vec![direct_walk()]);
         }
@@ -956,20 +1043,29 @@ impl TransitRoutingModule {
     ) -> Self {
         self.use_passenger_mode_mapping = enabled;
         self.passenger_modes = mappings;
-        self.passenger_mode_travel_utilities = scoring
-            .iter()
-            .map(|params| (params.mode.clone(), params.marginal_utility_of_traveling))
-            .collect();
-        self.performing_utility_per_hour = agent_scoring
-            .iter()
-            .find(|params| params.subpopulation == "person")
-            .map_or(6.0, |params| params.performing);
-        self.default_pt_travel_utility_per_hour = self
-            .passenger_mode_travel_utilities
-            .get("pt")
-            .copied()
-            .unwrap_or(-6.0);
+        self.routing_params_by_subpopulation =
+            build_routing_params_by_subpopulation(scoring, agent_scoring);
         self
+    }
+
+    /// Resolves the routing parameters for a single subpopulation, applying the documented
+    /// precedence: explicit subpopulation match, then the empty-subpopulation entry, then -6.0
+    /// for the `pt` baseline. Reference semantics matter: the returned struct is read-only here
+    /// and the routing module hands it to every leg-cost call inside one request.
+    fn resolve_routing_params(&self, subpopulation: &str) -> ResolvedRoutingParams {
+        if let Some(params) = self.routing_params_by_subpopulation.get(subpopulation) {
+            return params.clone();
+        }
+        if let Some(params) = self.routing_params_by_subpopulation.get("") {
+            return params.clone();
+        }
+        // No subpopulation entry and no empty-subpopulation default — fall back to the built-in
+        // defaults so a request without a configured subpopulation still gets finite costs.
+        ResolvedRoutingParams {
+            performing_utility_per_hour: 6.0,
+            pt_utility_per_hour: -6.0,
+            mode_utilities: std::collections::BTreeMap::new(),
+        }
     }
 
     pub(crate) fn with_range_queries(
@@ -983,6 +1079,16 @@ impl TransitRoutingModule {
             self.route_selector_settings = route_selector_settings;
         }
         self.random_seed = random_seed;
+        self
+    }
+
+    /// Sets the transfer penalties a PT itinerary pays. With MATSim's defaults this reproduces
+    /// the previous fixed cost of one utility, i.e. 300 seconds, per transfer.
+    pub(crate) fn with_transfer_penalty(
+        mut self,
+        transfer_penalty: TransitTransferPenalty,
+    ) -> Self {
+        self.transfer_penalty = transfer_penalty;
         self
     }
 
@@ -1251,11 +1357,10 @@ impl TransitRoutingModule {
             leg_only_handling: IntermodalLegOnlyHandling::Forbid,
             passenger_modes: std::collections::BTreeMap::new(),
             use_passenger_mode_mapping: false,
-            passenger_mode_travel_utilities: std::collections::BTreeMap::new(),
-            performing_utility_per_hour: 6.0,
-            default_pt_travel_utility_per_hour: -6.0,
+            routing_params_by_subpopulation: std::collections::BTreeMap::new(),
             range_query_settings: Vec::new(),
             route_selector_settings: vec![TransitRouteSelectorSettings::default()],
+            transfer_penalty: TransitTransferPenalty::default(),
             random_seed: crate::simulation::config::DEFAULT_RANDOM_SEED,
             capacity_feedback: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
         };
@@ -1318,6 +1423,9 @@ impl TransitRoutingModule {
         departure_time: SimTime,
     ) -> Vec<TransitSkimResult> {
         let access_stops = self.nearest_stops(origin);
+        // Skims have no per-person context — fall back to the empty-subpopulation default so
+        // cost-equivalent travel time still uses passenger-mode utilities when configured.
+        let routing_params = self.resolve_routing_params("");
 
         destinations
             .iter()
@@ -1329,11 +1437,20 @@ impl TransitRoutingModule {
                     .into_iter()
                     .map(|(stop_id, _)| stop_id)
                     .collect();
-                match self.find_best_path(destination, departure_time, &access_stops, &egress_stops)
-                {
+                match self.find_best_path(
+                    destination,
+                    departure_time,
+                    &access_stops,
+                    &egress_stops,
+                    &routing_params,
+                ) {
                     Some(path)
                         if direct_walk.as_secs_f64()
-                            >= self.path_cost_equivalent_seconds(&path, departure_time) =>
+                            >= self.path_cost_equivalent_seconds(
+                                &path,
+                                departure_time,
+                                &routing_params,
+                            ) =>
                     {
                         TransitSkimResult {
                             outcome: TransitSkimOutcome::Transit,
@@ -1598,18 +1715,23 @@ impl TransitRoutingModule {
 
     #[cfg(test)]
     fn path_cost(&self, path: &TransitPath, departure_time: SimTime) -> Duration {
-        let transfer_count = path.rides.len().saturating_sub(1) as u32;
-        path.arrival
-            .duration_since(departure_time)
-            .saturating_add(RAPTOR_TRANSFER_COST.saturating_mul(transfer_count))
+        let routing_params = self.resolve_routing_params("");
+        path.arrival.duration_since(departure_time)
+            + Duration::from_secs_f64(self.transfer_penalty_seconds(&path.rides, &routing_params))
     }
 
-    fn path_cost_equivalent_seconds(&self, path: &TransitPath, departure_time: SimTime) -> f64 {
+    fn path_cost_equivalent_seconds(
+        &self,
+        path: &TransitPath,
+        departure_time: SimTime,
+        routing_params: &ResolvedRoutingParams,
+    ) -> f64 {
         self.cost_equivalent_seconds(
             path.arrival,
             path.access_distance,
             &path.rides,
             departure_time,
+            routing_params,
         )
     }
 
@@ -1619,12 +1741,10 @@ impl TransitRoutingModule {
         access_distance: f64,
         rides: &[Ride],
         departure_time: SimTime,
+        routing_params: &ResolvedRoutingParams,
     ) -> f64 {
-        let transfer_count = rides.len().saturating_sub(1) as u32;
-        let base = arrival
-            .duration_since(departure_time)
-            .saturating_add(RAPTOR_TRANSFER_COST.saturating_mul(transfer_count))
-            .as_secs_f64();
+        let base = arrival.duration_since(departure_time).as_secs_f64()
+            + self.transfer_penalty_seconds(rides, routing_params);
         let feedback = self.capacity_feedback.load();
         let capacity_cost = rides
             .iter()
@@ -1633,18 +1753,19 @@ impl TransitRoutingModule {
         if !self.use_passenger_mode_mapping {
             return base + capacity_cost;
         }
+        let baseline =
+            routing_params.performing_utility_per_hour - routing_params.pt_utility_per_hour;
         base + rides
             .iter()
             .enumerate()
             .map(|(index, ride)| {
-                let utility = self
-                    .passenger_mode_travel_utilities
+                let utility = routing_params
+                    .mode_utilities
                     .get(&ride.passenger_mode)
                     .copied()
-                    .unwrap_or(self.default_pt_travel_utility_per_hour);
-                let baseline =
-                    self.performing_utility_per_hour - self.default_pt_travel_utility_per_hour;
-                let mode_cost_factor = (self.performing_utility_per_hour - utility) / baseline;
+                    .unwrap_or(routing_params.pt_utility_per_hour);
+                let mode_cost_factor =
+                    (routing_params.performing_utility_per_hour - utility) / baseline;
                 let leg_start = if index == 0 {
                     departure_time.saturating_add(self.walk_time(access_distance))
                 } else {
@@ -1723,6 +1844,66 @@ impl TransitRoutingModule {
         penalty
     }
 
+    /// Transfer penalties for a whole itinerary, priced into the seconds-based cost.
+    ///
+    /// MATSim keeps the penalty in utils and lets the search compare it against utils; this router
+    /// compares seconds, so utils are converted at the module's seconds-per-utility rate.
+    ///
+    /// The two shapes mirror MATSim's two calculators. `DefaultRaptorTransferCostCalculator` gives
+    /// every transfer one clipped cost that grows with the journey's elapsed travel time once a
+    /// per-travel-time-hour cost is configured; because it is recomputed from scratch at each path
+    /// element, the elapsed time runs from when riding began to the last alighting, which is
+    /// MATSim's `newArrivalTime - firstDepartureTime`. `ModeSpecificTransferCostCalculator` instead
+    /// adds the configured transport-mode offset per transfer and ignores travel time entirely; it
+    /// is selected by configuring any mode pair, and configuration rejects combining the two.
+    fn transfer_penalty_seconds(
+        &self,
+        rides: &[Ride],
+        routing_params: &ResolvedRoutingParams,
+    ) -> f64 {
+        let penalty = &self.transfer_penalty;
+        if rides.len() < 2 {
+            return 0.0;
+        }
+        // Transfer penalties are denominated in utils but this router compares seconds. One utility
+        // is worth `3600 / (performing - pt)` seconds of travel time, which is the same rate the
+        // mode factors below already use, so a config that changes the pt time weight reprices the
+        // penalty consistently instead of leaving it stale. At MATSim's pinned defaults this is
+        // 3600 / 12 = 300 seconds per utility.
+        let seconds_per_utility = 3600.0
+            / (routing_params.performing_utility_per_hour - routing_params.pt_utility_per_hour);
+        let utils = if penalty.is_mode_specific() {
+            // The first ride has no transfer before it, so each following ride contributes the
+            // cost of switching from the mode it arrived on.
+            rides
+                .windows(2)
+                .map(|pair| {
+                    penalty.clip(
+                        penalty.base_cost()
+                            + penalty
+                                .mode_penalty(&pair[0].transport_mode, &pair[1].transport_mode),
+                    )
+                })
+                .sum::<f64>()
+        } else {
+            let (Some(first), Some(last)) = (rides.first(), rides.last()) else {
+                return 0.0;
+            };
+            // MATSim prices the hourly term against the time riding actually began:
+            // `max(agent arrival at the first stop, vehicle arrival there)`
+            // (SwissRailRaptorCore:700). `boarding_time` is the vehicle's *departure* from that
+            // stop, which is later by any dwell there and so would under-count the penalty. The
+            // agent reached the stop no later than the departure, since a departure the agent would
+            // miss is skipped above, which leaves the vehicle's arrival as the origin.
+            let origin = first.vehicle_arrival_at_board;
+            let travel_seconds = last.alighting_time.saturating_sub(origin).as_secs();
+            penalty.clip(
+                penalty.base_cost() + penalty.per_travel_time_hour / 3600.0 * travel_seconds as f64,
+            ) * (rides.len() - 1) as f64
+        };
+        utils * seconds_per_utility
+    }
+
     fn select_range_query_path(
         &self,
         destination: &Coordinate,
@@ -1731,6 +1912,7 @@ impl TransitRoutingModule {
         egress_stops: &[FeederStop],
         window: &TransitRangeQuerySettings,
         person: Option<&InternalPerson>,
+        routing_params: &ResolvedRoutingParams,
     ) -> Option<TransitPath> {
         let earlier = Duration::from_secs(window.max_earlier_departure_sec);
         let later = Duration::from_secs(window.max_later_departure_sec);
@@ -1773,6 +1955,7 @@ impl TransitRoutingModule {
                 departure,
                 access_stops,
                 egress_stops,
+                routing_params,
             ));
         }
         let score = |path: &TransitPath| {
@@ -1874,6 +2057,7 @@ impl TransitRoutingModule {
         departure_time: SimTime,
         access_stops: &[(Id<TransitStopFacility>, f64)],
         egress_stops: &HashSet<Id<TransitStopFacility>>,
+        routing_params: &ResolvedRoutingParams,
     ) -> Option<TransitPath> {
         let access = access_stops
             .iter()
@@ -1902,7 +2086,13 @@ impl TransitRoutingModule {
             })
             .collect::<Vec<_>>();
         egress.sort_by(|a, b| a.stop.external().cmp(b.stop.external()));
-        self.find_best_path_with_feeders(destination, departure_time, &access, &egress)
+        self.find_best_path_with_feeders(
+            destination,
+            departure_time,
+            &access,
+            &egress,
+            routing_params,
+        )
     }
 
     /// Applies the configured leg-only policy to the paths the search produced. Leg-only paths are
@@ -1913,16 +2103,26 @@ impl TransitRoutingModule {
         departure_time: SimTime,
         access_stops: &[FeederStop],
         egress_stops: &[FeederStop],
+        routing_params: &ResolvedRoutingParams,
     ) -> Option<TransitPath> {
-        let candidates =
-            self.find_paths_with_feeders(destination, departure_time, access_stops, egress_stops);
+        let candidates = self.find_paths_with_feeders(
+            destination,
+            departure_time,
+            access_stops,
+            egress_stops,
+            routing_params,
+        );
         let cheapest = |paths: &[&TransitPath]| {
             paths
                 .iter()
                 .copied()
                 .min_by(|left, right| {
-                    self.path_cost_equivalent_seconds(left, departure_time)
-                        .total_cmp(&self.path_cost_equivalent_seconds(right, departure_time))
+                    self.path_cost_equivalent_seconds(left, departure_time, routing_params)
+                        .total_cmp(&self.path_cost_equivalent_seconds(
+                            right,
+                            departure_time,
+                            routing_params,
+                        ))
                         .then_with(|| transit_path_tiebreak(left, right))
                 })
                 .cloned()
@@ -1939,8 +2139,15 @@ impl TransitRoutingModule {
             IntermodalLegOnlyHandling::Forbid => cheapest(&transit),
             IntermodalLegOnlyHandling::Allow => match (cheapest(&transit), cheapest(&leg_only)) {
                 (Some(transit), Some(leg_only))
-                    if self.path_cost_equivalent_seconds(&leg_only, departure_time)
-                        < self.path_cost_equivalent_seconds(&transit, departure_time) =>
+                    if self.path_cost_equivalent_seconds(
+                        &leg_only,
+                        departure_time,
+                        routing_params,
+                    ) < self.path_cost_equivalent_seconds(
+                        &transit,
+                        departure_time,
+                        routing_params,
+                    ) =>
                 {
                     Some(leg_only)
                 }
@@ -1962,6 +2169,7 @@ impl TransitRoutingModule {
         departure_time: SimTime,
         access_stops: &[FeederStop],
         egress_stops: &[FeederStop],
+        routing_params: &ResolvedRoutingParams,
     ) -> Vec<TransitPath> {
         let mut states: HashMap<(Id<TransitStopFacility>, usize), Vec<TransitPathState>> =
             HashMap::new();
@@ -1977,6 +2185,7 @@ impl TransitRoutingModule {
                     access.distance,
                     &[],
                     departure_time,
+                    routing_params,
                 ),
                 access_distance: access.distance,
                 rides: Vec::new(),
@@ -2054,6 +2263,10 @@ impl TransitRoutingModule {
                         continue;
                     }
                     let board_offset = board_stop.departure_offset.unwrap_or_default();
+                    let board_arrival_offset = board_stop
+                        .arrival_offset
+                        .or(board_stop.departure_offset)
+                        .unwrap_or_default();
                     let arrival_at_boarding_stop =
                         arrival.saturating_add(transfer_time.unwrap_or_default());
                     let earliest_boarding = arrival_at_boarding_stop;
@@ -2100,8 +2313,12 @@ impl TransitRoutingModule {
                                 board: boarding_stop.clone(),
                                 alight: alight_stop.facility_id.clone(),
                                 boarding_time,
+                                vehicle_arrival_at_board: departure
+                                    .departure_time
+                                    .saturating_add(board_arrival_offset),
                                 alighting_time: stop_arrival,
                                 distance: ride_distance,
+                                transport_mode: route.transport_mode.external().to_owned(),
                                 passenger_mode: if self.use_passenger_mode_mapping {
                                     self.passenger_modes
                                         .get(route.transport_mode.external())
@@ -2129,6 +2346,7 @@ impl TransitRoutingModule {
                                     current.access_distance,
                                     &rides,
                                     departure_time,
+                                    routing_params,
                                 ),
                                 access_distance: current.access_distance,
                                 rides,
@@ -2393,6 +2611,7 @@ mod route_proposal_tests {
     use crate::simulation::config::{
         IntermodalAccessEgress, IntermodalLegOnlyHandling, IntermodalModeSelection,
         TransferConstruction, TransitRangeQuerySettings, TransitRouteSelectorSettings,
+        TransitTransferPenalty,
     };
     use crate::simulation::id::Id;
     use crate::simulation::replanning::routing::teleportation::TeleportationRoutingModule;
@@ -2567,6 +2786,181 @@ mod route_proposal_tests {
         assert_eq!(results[0].travel_time, Some(Duration::from_secs(58 * 60)));
     }
 
+    /// The hourly penalty is priced against when riding began, not when the vehicle leaves the
+    /// first stop. MATSim uses `max(agent arrival, vehicle arrival)` (SwissRailRaptorCore:700),
+    /// so a vehicle dwelling 120 s at its first stop starts that clock 120 s earlier and the same
+    /// ride is charged 120 s / 3600 more per transfer. Asserted on one fixed pair of rides so the
+    /// comparison is the origin alone rather than two different journeys.
+    #[deterministic_id_test]
+    fn an_hourly_penalty_starts_at_the_vehicle_arrival_not_its_departure() {
+        let hourly = TransitTransferPenalty {
+            // A non-zero hourly cost is what makes `base_cost` take effect at all.
+            per_travel_time_hour: 6.0,
+            base_cost: 0.0,
+            ..TransitTransferPenalty::default()
+        };
+        let ride =
+            |boarding: SimTime, vehicle_arrival_at_board: SimTime, alighting: SimTime| Ride {
+                line: Id::create("line"),
+                route: Id::create("route"),
+                board: Id::create("ra"),
+                alight: Id::create("rc"),
+                boarding_time: boarding,
+                vehicle_arrival_at_board,
+                alighting_time: alighting,
+                distance: 0.0,
+                transport_mode: "train".to_string(),
+                passenger_mode: "pt".to_string(),
+                transfer_before: None,
+            };
+        let cost_in_utils = |rides: &[Ride]| {
+            let router = reference_router(reference_schedule(), 0.8333333333333334)
+                .with_transfer_penalty(hourly.clone());
+            let params = router.resolve_routing_params("");
+            router.transfer_penalty_seconds(rides, &params) / 300.0
+        };
+
+        // Two rides. The first dwells 120 s at its boarding stop: the vehicle reaches the stop at
+        // 08:00 but departs at 08:02, so every later stop is reached 120 s later too. Pricing the
+        // penalty from boarding instead of arrival would cancel that 120 s out entirely.
+        let dwelling = [
+            ride(
+                SimTime::from_secs(8 * 3600 + 120),
+                SimTime::from_secs(8 * 3600),
+                SimTime::from_secs(8 * 3600 + 720),
+            ),
+            ride(
+                SimTime::from_secs(8 * 3600 + 1020),
+                SimTime::from_secs(8 * 3600 + 1020),
+                SimTime::from_secs(8 * 3600 + 1620),
+            ),
+        ];
+        let no_dwell = [
+            ride(
+                SimTime::from_secs(8 * 3600),
+                SimTime::from_secs(8 * 3600),
+                SimTime::from_secs(8 * 3600 + 600),
+            ),
+            ride(
+                SimTime::from_secs(8 * 3600 + 900),
+                SimTime::from_secs(8 * 3600 + 900),
+                SimTime::from_secs(8 * 3600 + 1500),
+            ),
+        ];
+
+        let expected = 120.0 / 3600.0 * hourly.per_travel_time_hour;
+        assert!(
+            (cost_in_utils(&dwelling) - cost_in_utils(&no_dwell) - expected).abs() < 1e-9,
+            "boarding 120 s after the vehicle arrived should cost {expected} utils more per \
+             transfer, but the penalty moved by {}",
+            cost_in_utils(&dwelling) - cost_in_utils(&no_dwell)
+        );
+    }
+
+    #[deterministic_id_test]
+    fn a_penalty_worth_more_than_the_time_it_saves_rejects_the_transfer() {
+        let destination = Coordinate::new_2d(3950.0, 1050.0);
+        let access = [(Id::create("ra"), 0.0)];
+        let egress = HashSet::from([Id::create("rc")]);
+        let departure = SimTime::from_secs(8 * 3600);
+        let chosen = |router: &TransitRoutingModule| {
+            let params = router.resolve_routing_params("");
+            router
+                .find_best_path(&destination, departure, &access, &egress, &params)
+                .unwrap()
+                .rides
+                .iter()
+                .map(|ride| ride.route.external().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let default = reference_router(reference_schedule(), 0.8333333333333334);
+        assert_eq!(chosen(&default), ["a_to_b", "b_to_c"]);
+
+        // 25 utils is 7500 equivalent seconds, more than the 1500 s the transfer saves, so the
+        // direct service wins. 20 utils would not: the boundary is checked below, not asserted.
+        let penalized = reference_router(reference_schedule(), 0.8333333333333334)
+            .with_transfer_penalty(TransitTransferPenalty {
+                base_cost: 25.0,
+                per_travel_time_hour: 1.0,
+                ..TransitTransferPenalty::default()
+            });
+        assert_eq!(chosen(&penalized), ["direct"]);
+    }
+
+    /// The mode-to-mode penalty is keyed on the route's transport mode, not on the mapped
+    /// passenger mode: penalizing train -> bus leaves the reverse direction free.
+    #[deterministic_id_test]
+    fn a_mode_to_mode_penalty_only_costs_its_own_direction() {
+        let destination = Coordinate::new_2d(3950.0, 1050.0);
+        let access = [(Id::create("ra"), 0.0)];
+        let egress = HashSet::from([Id::create("rc")]);
+        let departure = SimTime::from_secs(8 * 3600);
+        let schedule = || {
+            let mut schedule = reference_schedule();
+            schedule
+                .lines_mut()
+                .get_mut(&Id::<TransitLine>::create("Reference Line"))
+                .unwrap()
+                .routes
+                .get_mut(&Id::<TransitRoute>::create("b_to_c"))
+                .unwrap()
+                .transport_mode = Id::create("bus");
+            schedule
+        };
+        let chosen = |router: &TransitRoutingModule| {
+            let params = router.resolve_routing_params("");
+            router
+                .find_best_path(&destination, departure, &access, &egress, &params)
+                .unwrap()
+                .rides
+                .iter()
+                .map(|ride| ride.route.external().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let penalty = TransitTransferPenalty {
+            by_transport_mode: vec![
+                crate::simulation::config::TransitModeToModeTransferPenalty {
+                    from_mode: "train".to_string(),
+                    to_mode: "bus".to_string(),
+                    transfer_penalty: 25.0,
+                },
+            ],
+            ..TransitTransferPenalty::default()
+        };
+
+        assert_eq!(
+            chosen(&reference_router(schedule(), 0.8333333333333334)),
+            ["a_to_b", "b_to_c"]
+        );
+        assert_eq!(
+            chosen(
+                &reference_router(schedule(), 0.8333333333333334)
+                    .with_transfer_penalty(penalty.clone())
+            ),
+            ["direct"]
+        );
+        // The same 25 utils on the unconfigured direction changes nothing, which shows the penalty
+        // was applied by mode pair rather than as an untargeted cost per transfer.
+        let reverse = TransitTransferPenalty {
+            by_transport_mode: vec![
+                crate::simulation::config::TransitModeToModeTransferPenalty {
+                    from_mode: "bus".to_string(),
+                    to_mode: "train".to_string(),
+                    transfer_penalty: 25.0,
+                },
+            ],
+            ..penalty
+        };
+        assert_eq!(
+            chosen(
+                &reference_router(schedule(), 0.8333333333333334).with_transfer_penalty(reverse)
+            ),
+            ["a_to_b", "b_to_c"]
+        );
+    }
+
     #[deterministic_id_test]
     fn mapped_passenger_modes_change_route_cost_and_are_returned_on_rides() {
         let mut schedule = reference_schedule();
@@ -2601,12 +2995,17 @@ mod route_proposal_tests {
             &[crate::simulation::config::AgentParameter::default()],
         );
         let destination = Coordinate::new_2d(3950.0, 1050.0);
-        let access_stops = [(Id::create("ra"), 0.0)];
-        let egress_stops = HashSet::from([Id::create("rc")]);
-        let access = access_stops;
-        let egress = egress_stops;
+        let access = [(Id::create("ra"), 0.0)];
+        let egress = HashSet::from([Id::create("rc")]);
+        let params = router.resolve_routing_params("");
         let path = router
-            .find_best_path(&destination, SimTime::from_secs(8 * 3600), &access, &egress)
+            .find_best_path(
+                &destination,
+                SimTime::from_secs(8 * 3600),
+                &access,
+                &egress,
+                &params,
+            )
             .unwrap();
 
         assert_eq!("direct", path.rides[0].route.external());
@@ -2638,6 +3037,170 @@ mod route_proposal_tests {
     }
 
     #[deterministic_id_test]
+    fn person_specific_routing_costs_let_two_passengers_choose_different_services() {
+        // Reuse the reference schedule and relabel the routes so the two-leg option (bus) and
+        // the direct option (rail) are visibly distinct services. With the same travel times and
+        // a flat per-mode utility the direct route wins; biasing each passenger's per-mode
+        // utility flips the answer for one but not the other.
+        let mut schedule = reference_schedule();
+        let line = schedule
+            .lines_mut()
+            .get_mut(&Id::<TransitLine>::create("Reference Line"))
+            .unwrap();
+        line.routes
+            .get_mut(&Id::<TransitRoute>::create("b_to_c"))
+            .unwrap()
+            .transport_mode = Id::create("bus");
+        line.routes
+            .get_mut(&Id::<TransitRoute>::create("direct"))
+            .unwrap()
+            .transport_mode = Id::create("rail");
+
+        // Both passengers share one router; the per-subpopulation `mode_params` are what differ.
+        // The `person` subpopulation keeps the rail-friendly utilities; the `freight` subpopulation
+        // ships rail-averse utilities that prefer the bus transfer.
+        let scoring = vec![
+            crate::simulation::config::ModeParameter {
+                subpopulation: "person".to_owned(),
+                mode: "rail".to_owned(),
+                marginal_utility_of_traveling: -1.0,
+                ..Default::default()
+            },
+            crate::simulation::config::ModeParameter {
+                subpopulation: "person".to_owned(),
+                mode: "road".to_owned(),
+                marginal_utility_of_traveling: -24.0,
+                ..Default::default()
+            },
+            crate::simulation::config::ModeParameter {
+                subpopulation: "freight".to_owned(),
+                mode: "rail".to_owned(),
+                marginal_utility_of_traveling: -24.0,
+                ..Default::default()
+            },
+            crate::simulation::config::ModeParameter {
+                subpopulation: "freight".to_owned(),
+                mode: "road".to_owned(),
+                marginal_utility_of_traveling: -1.0,
+                ..Default::default()
+            },
+        ];
+        let agent_scoring = vec![
+            crate::simulation::config::AgentParameter::default(),
+            crate::simulation::config::AgentParameter {
+                subpopulation: "freight".to_owned(),
+                performing: 6.0,
+                ..Default::default()
+            },
+        ];
+        let router = reference_router(schedule, 0.8333333333333334).with_passenger_mode_mapping(
+            true,
+            [
+                ("bus".to_owned(), "road".to_owned()),
+                ("rail".to_owned(), "rail".to_owned()),
+            ]
+            .into(),
+            &scoring,
+            &agent_scoring,
+        );
+
+        let departure = SimTime::from_secs(8 * 3600);
+
+        let passenger = InternalPerson::new(
+            Id::create("passenger"),
+            InternalPlan {
+                score: None,
+                selected: true,
+                elements: Vec::new(),
+                attributes: InternalAttributes::default(),
+            },
+        );
+        let freight = InternalPerson::new(
+            Id::create("freight-hauler"),
+            InternalPlan {
+                score: None,
+                selected: true,
+                elements: Vec::new(),
+                attributes: InternalAttributes::default(),
+            },
+        )
+        .with_subpopulation("freight");
+
+        let from = Facility::new_link_wrapper(
+            Coordinate::new_2d(1050.0, 1050.0),
+            Id::<Link>::create("11"),
+        );
+        let to = Facility::new_link_wrapper(
+            Coordinate::new_2d(3950.0, 1050.0),
+            Id::<Link>::create("33"),
+        );
+
+        let passenger_path = router
+            .calc_route(
+                RoutingRequestBuilder::default()
+                    .from(&from)
+                    .to(&to)
+                    .departure_time(departure)
+                    .person(Some(&passenger))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let freight_path = router
+            .calc_route(
+                RoutingRequestBuilder::default()
+                    .from(&from)
+                    .to(&to)
+                    .departure_time(departure)
+                    .person(Some(&freight))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+
+        // Inspect the pt legs only: the walks wrap them, so filter out the walk legs and read
+        // the route id from the embedded PT description. The route id identifies the service the
+        // passenger picked.
+        let pt_route = |elements: &[InternalPlanElement]| -> String {
+            elements
+                .iter()
+                .find_map(|element| {
+                    let leg = element.as_leg()?;
+                    leg.route
+                        .as_ref()?
+                        .as_pt()
+                        .map(|pt| pt.description.transit_route_id.clone())
+                })
+                .expect("the passenger picks a transit service")
+        };
+        let passenger_route = pt_route(&passenger_path);
+        let freight_route = pt_route(&freight_path);
+
+        // The passenger subpopulation prefers rail; freight prefers road. The competing
+        // candidates are the direct rail service and the bus transfer (a_to_b -> b_to_c), so the
+        // passengers must end up on different services. The freight itinerary contains two rides,
+        // which is enough to disambiguate it from the single-ride rail itinerary.
+        assert_eq!(passenger_route, "direct");
+        assert_eq!(freight_route, "a_to_b");
+        assert_ne!(passenger_route, freight_route);
+
+        // Repeating the request for the same passenger is deterministic: the same cost resolves
+        // to the same service.
+        let passenger_again = router
+            .calc_route(
+                RoutingRequestBuilder::default()
+                    .from(&from)
+                    .to(&to)
+                    .departure_time(departure)
+                    .person(Some(&passenger))
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(pt_route(&passenger_again), passenger_route);
+    }
+
+    #[deterministic_id_test]
     fn shared_stop_bus_rail_transfer_is_considered_with_rail_rail() {
         let mut schedule = reference_schedule();
         let line = schedule
@@ -2655,11 +3218,12 @@ mod route_proposal_tests {
         let access = access_stops;
         let egress = egress_stops;
         let departure = SimTime::from_secs(8 * 3600);
+        let params = router.resolve_routing_params("");
         let path = router
-            .find_best_path(&destination, departure, &access, &egress)
+            .find_best_path(&destination, departure, &access, &egress, &params)
             .unwrap();
         let repeated = router
-            .find_best_path(&destination, departure, &access, &egress)
+            .find_best_path(&destination, departure, &access, &egress, &params)
             .unwrap();
 
         assert_eq!(
@@ -2869,8 +3433,9 @@ mod route_proposal_tests {
                 router.transfer_time(&Id::create("rb"), &Id::create("rb"), 0.0),
                 Duration::from_secs(60)
             );
+            let params = router.resolve_routing_params("");
             let just_catches = router
-                .find_best_path(&destination, departure, &access, &egress)
+                .find_best_path(&destination, departure, &access, &egress, &params)
                 .unwrap();
             assert_eq!(just_catches.rides.len(), 2);
         }
@@ -2890,9 +3455,10 @@ mod route_proposal_tests {
                 0.8333333333333334,
                 construction,
             );
+            let params = router.resolve_routing_params("");
             assert!(
                 router
-                    .find_best_path(&destination, departure, &access, &egress)
+                    .find_best_path(&destination, departure, &access, &egress, &params)
                     .is_none()
             );
         }
@@ -2921,6 +3487,7 @@ mod route_proposal_tests {
                 0.8333333333333334,
                 construction,
             );
+            let params = router.resolve_routing_params("");
             assert!(router.nearby_transfer_stops(&Id::create("rb")).is_empty());
             assert!(
                 router
@@ -2929,6 +3496,7 @@ mod route_proposal_tests {
                         departure,
                         &access,
                         &egress,
+                        &params,
                     )
                     .is_none()
             );
@@ -2963,8 +3531,9 @@ mod route_proposal_tests {
                 None,
                 construction,
             );
+            let params = router.resolve_routing_params("");
             let path = router
-                .find_best_path(&destination, departure, &access, &egress)
+                .find_best_path(&destination, departure, &access, &egress, &params)
                 .unwrap();
             assert_eq!(*expected_arrival.get_or_insert(path.arrival), path.arrival);
             let itinerary = path
@@ -2981,7 +3550,7 @@ mod route_proposal_tests {
             assert_eq!(itinerary, expected);
             assert_eq!(
                 router
-                    .find_best_path(&destination, departure, &access, &egress)
+                    .find_best_path(&destination, departure, &access, &egress, &params)
                     .unwrap()
                     .arrival,
                 path.arrival
@@ -3024,8 +3593,9 @@ mod route_proposal_tests {
             Arc::new(Garage::default()),
             None,
         );
+        let params = router.resolve_routing_params("");
         let path = router
-            .find_best_path(&destination, departure, &access, &egress)
+            .find_best_path(&destination, departure, &access, &egress, &params)
             .unwrap();
         assert_eq!(path.rides[1].board.external(), "rb_platform");
         assert_eq!(
@@ -3151,9 +3721,10 @@ mod route_proposal_tests {
             Arc::new(Garage::default()),
             None,
         );
+        let params = router.resolve_routing_params("");
         assert!(
             router
-                .find_best_path(&destination, departure, &access, &egress)
+                .find_best_path(&destination, departure, &access, &egress, &params)
                 .is_none()
         );
     }
@@ -3167,8 +3738,15 @@ mod route_proposal_tests {
         let egress = egress_stops;
         let destination = Coordinate::new_2d(3950.0, 1050.0);
 
+        let params = router.resolve_routing_params("");
         let final_departure = router
-            .find_best_path(&destination, SimTime::from_secs(9 * 3600), &access, &egress)
+            .find_best_path(
+                &destination,
+                SimTime::from_secs(9 * 3600),
+                &access,
+                &egress,
+                &params,
+            )
             .unwrap();
         assert_eq!(final_departure.rides[0].route.external(), "direct");
         assert_eq!(
@@ -3183,6 +3761,7 @@ mod route_proposal_tests {
                     SimTime::from_secs(24 * 3600),
                     &access,
                     &egress,
+                    &params,
                 )
                 .is_none()
         );
@@ -3200,12 +3779,14 @@ mod route_proposal_tests {
             .unwrap()
             .departure_time = SimTime::from_secs(25 * 3600);
         let extended_router = reference_router(extended_schedule, 0.8333333333333334);
+        let extended_params = extended_router.resolve_routing_params("");
         let after_midnight = extended_router
             .find_best_path(
                 &destination,
                 SimTime::from_secs(25 * 3600),
                 &access,
                 &egress,
+                &extended_params,
             )
             .unwrap();
         assert_eq!(after_midnight.rides[0].route.external(), "direct");
@@ -3985,10 +4566,26 @@ mod route_proposal_tests {
         };
 
         let chosen = router
-            .select_range_query_path(&destination, desired, &access, &egress, &settings, None)
+            .select_range_query_path(
+                &destination,
+                desired,
+                &access,
+                &egress,
+                &settings,
+                None,
+                &router.resolve_routing_params(""),
+            )
             .unwrap();
         let repeated = router
-            .select_range_query_path(&destination, desired, &access, &egress, &settings, None)
+            .select_range_query_path(
+                &destination,
+                desired,
+                &access,
+                &egress,
+                &settings,
+                None,
+                &router.resolve_routing_params(""),
+            )
             .unwrap();
 
         assert!(chosen.departure >= desired.saturating_sub(Duration::from_secs(60)));
@@ -4000,8 +4597,9 @@ mod route_proposal_tests {
         );
 
         let no_window = TransitRangeQuerySettings::default();
+        let params = router.resolve_routing_params("");
         let fixed_time = router
-            .find_best_path(&destination, desired, &access_stops, &egress_stops)
+            .find_best_path_with_feeders(&destination, desired, &access, &egress, &params)
             .unwrap();
         assert_eq!(fixed_time.departure, desired);
 
@@ -4015,8 +4613,18 @@ mod route_proposal_tests {
                     subpopulations: Vec::new(),
                 }],
                 42,
+            );
+        let transfer_averse_params = transfer_averse.resolve_routing_params("");
+        let transfer_averse = transfer_averse
+            .select_range_query_path(
+                &destination,
+                desired,
+                &access,
+                &egress,
+                &no_window,
+                None,
+                &transfer_averse_params,
             )
-            .select_range_query_path(&destination, desired, &access, &egress, &no_window, None)
             .unwrap();
         assert_eq!("direct", transfer_averse.rides[0].route.external());
 
@@ -4030,6 +4638,7 @@ mod route_proposal_tests {
                     &egress,
                     &no_window,
                     None,
+                    &params,
                 )
                 .is_none()
         );
@@ -4068,6 +4677,7 @@ mod route_proposal_tests {
         };
         let first = person("stream-person-1");
         let second = person("stream-person-2");
+        let params = router.resolve_routing_params("");
         let choose = |person: &InternalPerson| {
             router
                 .select_range_query_path(
@@ -4077,6 +4687,7 @@ mod route_proposal_tests {
                     &egress,
                     &settings,
                     Some(person),
+                    &params,
                 )
                 .unwrap()
         };

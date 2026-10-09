@@ -9,6 +9,7 @@
 //! routing requests.
 
 use macros::deterministic_id_test;
+use matsim_rust::simulation::InternalAttributes;
 use matsim_rust::simulation::config::{CommandLineArgs, Config};
 use matsim_rust::simulation::controller::controller::ControllerBuilder;
 use matsim_rust::simulation::events::utils::{read_events, read_partitioned_events};
@@ -25,7 +26,9 @@ use matsim_rust::simulation::replanning::routing::{
 };
 use matsim_rust::simulation::scenario::network::Link;
 use matsim_rust::simulation::scenario::population::Population;
-use matsim_rust::simulation::scenario::population::{InternalPerson, InternalPlanElement};
+use matsim_rust::simulation::scenario::population::{
+    InternalPerson, InternalPlan, InternalPlanElement,
+};
 use matsim_rust::simulation::scenario::transit::TransitStopFacility;
 use matsim_rust::simulation::scenario::{Coordinate, Scenario};
 use matsim_rust::simulation::time::SimTime;
@@ -135,6 +138,135 @@ fn queue_execution_matches_the_pinned_reference() {
 #[deterministic_id_test(matsim_rust)]
 fn queue_execution_matches_the_pinned_reference_across_partitions() {
     assert_queue_execution_matches(2);
+}
+
+#[deterministic_id_test(matsim_rust)]
+fn timetable_train_and_queue_bus_match_the_pinned_reference() {
+    let config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_simulated/timetable_mixed.yml",
+    ));
+    let output_dir = config.output().output_dir.clone();
+    let reference = read_reference("timetable_mixed");
+    verify_same_conditions(&reference, &config);
+
+    run(config);
+
+    let rust = normalize_partitioned_events(&output_dir.join("events"), 1);
+    let relevant = |event: &&Value| {
+        !event
+            .get("person")
+            .and_then(Value::as_str)
+            .is_some_and(|person| person.starts_with("pt_"))
+            && matches!(
+                event["type"].as_str(),
+                Some(
+                    "waitingForPt"
+                        | "PersonEntersVehicle"
+                        | "PersonLeavesVehicle"
+                        | "PersonEntersPtVehicle"
+                        | "PersonLeavesPtVehicle"
+                        | "VehicleArrivesAtFacility"
+                        | "VehicleDepartsAtFacility"
+                        | "stuckAndAbort"
+                )
+            )
+    };
+    let mut expected_by_entity = std::collections::BTreeMap::<String, Vec<&Value>>::new();
+    let mut actual_by_entity = std::collections::BTreeMap::<String, Vec<&Value>>::new();
+    for event in reference.events.iter().filter(relevant) {
+        let entity = event
+            .get("person")
+            .or_else(|| event.get("vehicle"))
+            .and_then(Value::as_str)
+            .unwrap();
+        expected_by_entity
+            .entry(entity.to_owned())
+            .or_default()
+            .push(event);
+    }
+    for event in rust.iter().filter(relevant) {
+        let entity = event
+            .get("person")
+            .or_else(|| event.get("vehicle"))
+            .and_then(Value::as_str)
+            .unwrap();
+        actual_by_entity
+            .entry(entity.to_owned())
+            .or_default()
+            .push(event);
+    }
+    assert_eq!(
+        expected_by_entity.keys().collect::<Vec<_>>(),
+        actual_by_entity.keys().collect::<Vec<_>>()
+    );
+    for (entity, expected) in expected_by_entity {
+        let actual = &actual_by_entity[&entity];
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "transit event count differs for {entity}"
+        );
+        for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+            let expected_type = match expected["type"].as_str() {
+                Some("PersonEntersVehicle") => "PersonEntersPtVehicle",
+                Some("PersonLeavesVehicle") => "PersonLeavesPtVehicle",
+                Some(kind) => kind,
+                None => unreachable!(),
+            };
+            assert_eq!(
+                expected_type, actual["type"],
+                "{entity} event {index} type differs"
+            );
+            for field in ["person", "vehicle", "facility", "atStop", "destinationStop"] {
+                assert_eq!(
+                    expected.get(field),
+                    actual.get(field),
+                    "{entity} event {index} differs in {field}"
+                );
+            }
+            let time_delta = actual["time"].as_f64().unwrap() - expected["time"].as_f64().unwrap();
+            let time_tolerance = if entity == "bus-0740" || expected["vehicle"] == "bus-0740" {
+                2.0
+            } else {
+                1.0
+            };
+            assert!(
+                time_delta.abs() <= time_tolerance,
+                "{entity} event {index} differs by {time_delta}s (limit {time_tolerance}s): expected {expected}, got {actual}"
+            );
+        }
+    }
+    assert!(
+        rust.iter()
+            .any(|event| event["type"] == "VehicleArrivesAtFacility"
+                && event["vehicle"] == "train-0750"
+                && event["facility"] == "2a")
+    );
+    assert!(
+        rust.iter()
+            .any(|event| event["type"] == "VehicleArrivesAtFacility"
+                && event["vehicle"] == "bus-0740"
+                && event["facility"] == "2b")
+    );
+    for (person, vehicle) in [
+        ("capacity-a", "train-0800"),
+        ("capacity-b", "train-0750"),
+        ("train-to-bus-transfer", "train-0730"),
+        ("train-to-bus-transfer", "bus-0740"),
+    ] {
+        assert!(
+            rust.iter().any(|event| {
+                event["type"] == "PersonEntersPtVehicle"
+                    && event["person"] == person
+                    && event["vehicle"] == vehicle
+            }),
+            "{person} should board {vehicle}"
+        );
+    }
+    assert!(
+        rust.iter()
+            .any(|event| event["type"] == "stuckAndAbort" && event["person"] == "stranded-at-end")
+    );
 }
 
 fn assert_queue_execution_matches(num_parts: u32) {
@@ -882,6 +1014,115 @@ fn intermodal_feeder_only_routes_match_the_pinned_reference() {
 }
 
 /// Person and stop filters choose different feeder modes for otherwise identical requests.
+
+/// A transfer penalty large enough to outweigh the travel time it saves makes both routers reject
+/// the faster transfer and take the direct service. The same schedule and request take the transfer
+/// under the pinned default penalty, which `routing_direct_vs_transfer` already records, so the two
+/// fixtures together show the penalty deciding between the same two itineraries.
+#[deterministic_id_test(matsim_rust)]
+fn a_penalized_transfer_loses_to_the_direct_service() {
+    let request = load_request("routing_transfer_penalty_shared_stop");
+    let config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/routing_transfer_penalty_shared_stop/config.yml",
+    ));
+    let reference = read_reference("routing_transfer_penalty_shared_stop");
+    verify_same_conditions(&reference, &config);
+    let router = run(config);
+    let rust = calc_pt_route(&request, &router, None);
+
+    let expected = reference
+        .itineraries
+        .iter()
+        .find(|itinerary| itinerary["id"] == request["id"])
+        .expect("the request is recorded in the reference");
+
+    // The direct service arrives 25 minutes later than the transfer this fixture penalizes away.
+    assert_eq!(rides(expected), vec![ride("direct", "ra", "rc", 28800.0)]);
+    assert_eq!(arrival_time(expected), 31_800.0);
+
+    assert_eq!(
+        rides(&rust),
+        rides(expected),
+        "Rust's penalized route differs from the pinned Java itinerary"
+    );
+    assert_eq!(arrival_time(&rust), arrival_time(expected));
+    // The direct route has no transfer, so this pins that the penalty is not charged on a journey
+    // that never transfers, and that Rust's total cost converts to Java's utility units exactly.
+    assert_eq!(rides(&rust).len(), 1);
+    assert_eq!(
+        expected["generalized_cost"].as_f64(),
+        Some(rust_cost_utils(&rust, &request)),
+        "Rust's generalized cost differs from MATSim's selected-route cost"
+    );
+}
+
+/// A penalty on one transport-mode pair changes which service a mixed-mode journey takes: the
+/// faster bus transfer loses to the slower rail transfer, while the direct service stays available.
+#[deterministic_id_test(matsim_rust)]
+fn a_mode_to_mode_penalty_replaces_the_bus_transfer_with_the_rail_transfer() {
+    let request = load_request("routing_transfer_penalty_mode_to_mode");
+    let config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/routing_transfer_penalty_mode_to_mode/config.yml",
+    ));
+    let reference = read_reference("routing_transfer_penalty_mode_to_mode");
+    verify_same_conditions(&reference, &config);
+    let router = run(config);
+    let rust = calc_pt_route(&request, &router, None);
+
+    let expected = reference
+        .itineraries
+        .iter()
+        .find(|itinerary| itinerary["id"] == request["id"])
+        .expect("the request is recorded in the reference");
+
+    assert_eq!(
+        rides(expected),
+        vec![
+            ride("a_to_b", "ra", "rb", 28800.0),
+            ride("b_to_c", "rb_platform", "rc", 29700.0),
+        ],
+        "the reference no longer switches from the bus to the rail transfer"
+    );
+    assert_eq!(arrival_time(expected), 30_300.0);
+
+    assert_eq!(
+        rides(&rust),
+        rides(expected),
+        "Rust's penalized route differs from the pinned Java itinerary"
+    );
+    assert_eq!(arrival_time(&rust), arrival_time(expected));
+    assert!(
+        !rides(&rust)
+            .iter()
+            .any(|ride| ride["route"] == "b_to_c_bus"),
+        "Rust still takes the penalized bus transfer"
+    );
+
+    // KNOWN DEVIATION: the selected route, its rides and its arrival all match, but the recorded
+    // route cost does not. MATSim's ModeSpecificTransferCostCalculator ignores its
+    // `existingTransferCosts` argument and returns the whole per-transfer cost, which
+    // SwissRailRaptorCore then re-adds while walking the path; this router charges one cost per
+    // transfer. The two numbers are pinned so the gap stays visible and cannot drift silently.
+    // `routing_transfer_penalty_shared_stop` shows the costs agreeing exactly where the route has
+    // no transfers, so the conversion itself is sound and this is specific to mode-specific
+    // penalties. Closing the gap means porting MATSim's incremental transfer accounting; see
+    // docs/pt_java_reference.md.
+    assert_eq!(
+        expected["generalized_cost"].as_f64(),
+        Some(9.0),
+        "the reference's recorded route cost changed"
+    );
+    assert_eq!(
+        rust_cost_utils(&rust, &request),
+        6.0,
+        "Rust's route cost changed; if this moved, re-check the known deviation above before \
+         changing the reference"
+    );
+}
+
+/// The range profile includes both inclusive window boundaries and never repeats yesterday's
+/// schedule after the final service. The pinned Java router falls back to walking when no PT route
+/// exists; Rust reports no PT path at that boundary.
 #[deterministic_id_test(matsim_rust)]
 fn intermodal_person_and_stop_eligibility_match_the_pinned_reference() {
     let config = Config::from_args(CommandLineArgs::new_with_path(
@@ -1535,6 +1776,17 @@ fn arrival_time(itinerary: &Value) -> f64 {
         .unwrap_or_else(|| panic!("{itinerary} has no arrival time"))
 }
 
+/// Rust prices a route in seconds: the elapsed time plus one utility (300 s at MATSim's pinned
+/// defaults) per transfer. MATSim records its cost in utils, and at those defaults pt time costs
+/// 12 utils per hour, so the conversion is exact. `docs/pt_java_reference.md` states this
+/// conversion as the rule for comparing the two.
+fn rust_cost_utils(itinerary: &Value, request: &Value) -> f64 {
+    let transfers = rides(itinerary).len().saturating_sub(1) as f64;
+    let seconds =
+        arrival_time(itinerary) - request["departure_time"].as_f64().unwrap() + 300.0 * transfers;
+    seconds * 12.0 / 3600.0
+}
+
 /// One line describing an event. It walks `IDENTITY` rather than repeating the field list, so a
 /// field added to the comparison also shows up in the failure message.
 fn summarize_event(record: &Value) -> String {
@@ -1694,6 +1946,98 @@ fn mapped_passenger_modes_match_the_pinned_java_itinerary() {
     );
 }
 
+/// Per-subpopulation scoring costs let two passengers on the same plan pick different services.
+/// The fixture mirrors `routing_mapped_modes` but adds two requests: one for the default
+/// `person` subpopulation (rail-loyal) and one for `freight` (bus-loyal).
+#[deterministic_id_test(matsim_rust)]
+fn person_specific_routing_costs_let_two_passengers_choose_different_services() {
+    let config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/routing_person_specific_costs/config.yml",
+    ));
+    let reference = read_reference("routing_person_specific_costs");
+    verify_same_conditions(&reference, &config);
+    let router = run(config);
+
+    let person_request = load_request_at("routing_person_specific_costs", 0);
+    let freight_request = load_request_at("routing_person_specific_costs", 1);
+    let internal_person = |request: &Value| {
+        let person = &request["person"];
+        InternalPerson::new(
+            Id::create(person["id"].as_str().unwrap()),
+            InternalPlan {
+                score: None,
+                selected: true,
+                elements: Vec::new(),
+                attributes: InternalAttributes::default(),
+            },
+        )
+        .with_subpopulation(person["subpopulation"].as_str().unwrap())
+    };
+    let person = internal_person(&person_request);
+    let freight = internal_person(&freight_request);
+    let person_route = calc_pt_route(&person_request, &router, Some(&person));
+    let freight_route = calc_pt_route(&freight_request, &router, Some(&freight));
+    let reference_itinerary = |id: &str| {
+        reference
+            .itineraries
+            .iter()
+            .find(|itinerary| itinerary["id"] == id)
+            .unwrap_or_else(|| panic!("the reference is missing request {id}"))
+    };
+    let person_reference = reference_itinerary("person_prefers_rail");
+    let freight_reference = reference_itinerary("freight_prefers_bus");
+
+    // The person subpopulation prefers rail: the single-ride direct service beats the bus
+    // transfer by cost. The freight subpopulation inverts those utilities and prefers the bus
+    // transfer. Asserting on the chosen route id makes the divergence unambiguous.
+    assert_eq!(
+        rides(&person_route),
+        vec![ride("direct", "ra", "rc", 28800.0)],
+        "the default subpopulation keeps the rail-loyal choice"
+    );
+    assert_eq!(
+        rides(&freight_route),
+        vec![
+            ride("a_to_b", "ra", "rb", 28800.0),
+            ride("b_to_c", "rb", "rc", 29700.0)
+        ],
+        "the freight subpopulation inverts the per-mode utility and picks the bus transfer"
+    );
+    assert_ne!(rides(&person_route), rides(&freight_route));
+    assert_eq!(rides(person_reference), rides(&person_route));
+    assert_eq!(rides(freight_reference), rides(&freight_route));
+    assert_eq!(arrival_time(person_reference), arrival_time(&person_route));
+    assert_eq!(
+        arrival_time(freight_reference),
+        arrival_time(&freight_route)
+    );
+
+    assert_eq!(
+        calc_pt_route(&person_request, &router, Some(&person)),
+        person_route,
+        "repeating the same request should preserve its unique optimum"
+    );
+    let mut partitioned_config = Config::from_args(CommandLineArgs::new_with_path(
+        "./tests/resources/pt_reference/routing_person_specific_costs/config.yml",
+    ));
+    partitioned_config.partitioning_mut().num_parts = 2;
+    partitioned_config.output_mut().output_dir.push("two_parts");
+    let partitioned_router = run(partitioned_config);
+    assert_eq!(
+        calc_pt_route(&person_request, &partitioned_router, Some(&person)),
+        person_route,
+        "partition changes should preserve the default passenger's unique optimum"
+    );
+    assert_eq!(
+        calc_pt_route(&freight_request, &partitioned_router, Some(&freight)),
+        freight_route,
+        "partition changes should preserve the freight passenger's unique optimum"
+    );
+}
+
+/// The range profile includes both inclusive window boundaries and never repeats yesterday's
+/// schedule after the final service. The pinned Java router falls back to walking when no PT route
+/// exists; Rust reports no PT path at that boundary.
 #[deterministic_id_test(matsim_rust)]
 fn range_query_matches_java_at_both_window_boundaries_and_after_final_service() {
     let config = Config::from_args(CommandLineArgs::new_with_path(
