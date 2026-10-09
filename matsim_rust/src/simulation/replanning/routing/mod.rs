@@ -13,7 +13,7 @@ use crate::simulation::scenario::population::{
     InternalActivity, InternalGenericRoute, InternalLeg, InternalPerson, InternalPlanElement,
     InternalPtRoute, InternalPtRouteDescription, InternalRoute, Population,
 };
-use crate::simulation::scenario::transit::TransitDeparture;
+use crate::simulation::scenario::transit::{ChainedDeparture, TransitDeparture};
 use crate::simulation::scenario::transit::{TransitSchedule, TransitStopFacility};
 use crate::simulation::scenario::vehicles::{Garage, InternalVehicle};
 use crate::simulation::time::SimTime;
@@ -533,6 +533,7 @@ struct Ride {
     transport_mode: String,
     passenger_mode: String,
     transfer_before: Option<(f64, f64, Duration)>,
+    chained_from_previous: bool,
 }
 
 /// A door-to-door transit connection.
@@ -1188,7 +1189,8 @@ impl TransitRoutingModule {
             ))
         };
 
-        let first_stop = &path.rides[0].board;
+        let rides = collapse_chained_rides(&path.rides);
+        let first_stop = &rides[0].board;
         let mut elements = path.access_route.as_ref().map_or_else(
             || {
                 vec![walk_leg(
@@ -1203,7 +1205,7 @@ impl TransitRoutingModule {
         );
         elements.push(interaction(first_stop));
         let mut time = path.departure.saturating_add(path.access_time);
-        for (ride_index, ride) in path.rides.iter().enumerate() {
+        for (ride_index, ride) in rides.iter().enumerate() {
             let travel_time = ride.alighting_time.duration_since(time);
             let route = InternalRoute::Pt(InternalPtRoute {
                 generic_delegate: InternalGenericRoute::new(
@@ -1230,7 +1232,7 @@ impl TransitRoutingModule {
             )));
             elements.push(interaction(&ride.alight));
             time = ride.alighting_time;
-            if let Some(next_ride) = path.rides.get(ride_index + 1) {
+            if let Some(next_ride) = rides.get(ride_index + 1) {
                 let (_, transfer_distance, transfer_time) = next_ride
                     .transfer_before
                     .expect("every ride after the first has a transfer");
@@ -1726,24 +1728,18 @@ impl TransitRoutingModule {
         departure_time: SimTime,
         routing_params: &ResolvedRoutingParams,
     ) -> f64 {
-        self.cost_equivalent_seconds(
-            path.arrival,
-            path.access_distance,
-            &path.rides,
-            departure_time,
-            routing_params,
-        )
+        self.cost_equivalent_seconds(path.arrival, &path.rides, departure_time, routing_params)
     }
 
     fn cost_equivalent_seconds(
         &self,
         arrival: SimTime,
-        access_distance: f64,
         rides: &[Ride],
         departure_time: SimTime,
         routing_params: &ResolvedRoutingParams,
     ) -> f64 {
         let base = arrival.duration_since(departure_time).as_secs_f64()
+            - chained_dwell_seconds(rides)
             + self.transfer_penalty_seconds(rides, routing_params);
         let feedback = self.capacity_feedback.load();
         let capacity_cost = rides
@@ -1757,8 +1753,7 @@ impl TransitRoutingModule {
             routing_params.performing_utility_per_hour - routing_params.pt_utility_per_hour;
         base + rides
             .iter()
-            .enumerate()
-            .map(|(index, ride)| {
+            .map(|ride| {
                 let utility = routing_params
                     .mode_utilities
                     .get(&ride.passenger_mode)
@@ -1766,19 +1761,10 @@ impl TransitRoutingModule {
                     .unwrap_or(routing_params.pt_utility_per_hour);
                 let mode_cost_factor =
                     (routing_params.performing_utility_per_hour - utility) / baseline;
-                let leg_start = if index == 0 {
-                    departure_time.saturating_add(self.walk_time(access_distance))
-                } else {
-                    let previous = &rides[index - 1];
-                    let transfer_distance = Coordinate::euclidean_distance(
-                        &self.schedule.get_facility(&previous.alight).coord,
-                        &self.schedule.get_facility(&ride.board).coord,
-                    );
-                    previous
-                        .alighting_time
-                        .saturating_add(self.walk_time(transfer_distance))
-                };
-                ride.alighting_time.duration_since(leg_start).as_secs_f64()
+                // Transfer walking and waiting stay at the baseline PT cost, not the next mode's.
+                ride.alighting_time
+                    .duration_since(ride.boarding_time)
+                    .as_secs_f64()
                     * (mode_cost_factor - 1.0)
             })
             .sum::<f64>()
@@ -1862,7 +1848,8 @@ impl TransitRoutingModule {
         routing_params: &ResolvedRoutingParams,
     ) -> f64 {
         let penalty = &self.transfer_penalty;
-        if rides.len() < 2 {
+        let transfers = transfer_count(rides);
+        if transfers == 0 {
             return 0.0;
         }
         // Transfer penalties are denominated in utils but this router compares seconds. One utility
@@ -1876,12 +1863,15 @@ impl TransitRoutingModule {
             // The first ride has no transfer before it, so each following ride contributes the
             // cost of switching from the mode it arrived on.
             rides
-                .windows(2)
-                .map(|pair| {
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter(|(_, ride)| ride.transfer_before.is_some())
+                .map(|(index, ride)| {
+                    let previous = &rides[index - 1];
                     penalty.clip(
                         penalty.base_cost()
-                            + penalty
-                                .mode_penalty(&pair[0].transport_mode, &pair[1].transport_mode),
+                            + penalty.mode_penalty(&previous.transport_mode, &ride.transport_mode),
                     )
                 })
                 .sum::<f64>()
@@ -1899,7 +1889,7 @@ impl TransitRoutingModule {
             let travel_seconds = last.alighting_time.saturating_sub(origin).as_secs();
             penalty.clip(
                 penalty.base_cost() + penalty.per_travel_time_hour / 3600.0 * travel_seconds as f64,
-            ) * (rides.len() - 1) as f64
+            ) * transfers as f64
         };
         utils * seconds_per_utility
     }
@@ -1966,8 +1956,9 @@ impl TransitRoutingModule {
                     .abs_diff(desired_departure.as_nanos()) as f64
                     / 1_000_000_000.0)
                 + selector.beta_travel_time
-                    * path.arrival.duration_since(path.departure).as_secs_f64()
-                + selector.beta_transfer_count * path.rides.len().saturating_sub(1) as f64
+                    * (path.arrival.duration_since(path.departure).as_secs_f64()
+                        - chained_dwell_seconds(&path.rides))
+                + selector.beta_transfer_count * transfer_count(&path.rides) as f64
         };
         let Some(best_score) = candidates.iter().map(&score).reduce(f64::min) else {
             return None;
@@ -2182,7 +2173,6 @@ impl TransitRoutingModule {
                 arrival: departure_time.saturating_add(access.time),
                 cost: self.cost_equivalent_seconds(
                     departure_time.saturating_add(access.time),
-                    access.distance,
                     &[],
                     departure_time,
                     routing_params,
@@ -2259,18 +2249,13 @@ impl TransitRoutingModule {
                     let line = self.schedule.get_line(&route_ref.line_id);
                     let route = line.routes.get(&route_ref.route_id).unwrap();
                     let board_stop = &route.stops[route_ref.stop_index];
-                    if !board_stop.allow_boarding {
-                        continue;
-                    }
+                    let chained_targets =
+                        chained_departures_from(&self.schedule, &current.rides, &boarding_stop);
                     let board_offset = board_stop.departure_offset.unwrap_or_default();
                     let board_arrival_offset = board_stop
                         .arrival_offset
                         .or(board_stop.departure_offset)
                         .unwrap_or_default();
-                    let arrival_at_boarding_stop =
-                        arrival.saturating_add(transfer_time.unwrap_or_default());
-                    let earliest_boarding = arrival_at_boarding_stop;
-
                     for (alight_index, alight_stop) in route
                         .stops
                         .iter()
@@ -2285,6 +2270,22 @@ impl TransitRoutingModule {
                             .or(alight_stop.departure_offset)
                             .unwrap_or_default();
                         for departure in &route.departures {
+                            let chained_continuation = chained_targets.is_some_and(|targets| {
+                                targets.iter().any(|target| {
+                                    target.transit_line_id == route_ref.line_id
+                                        && target.transit_route_id == route_ref.route_id
+                                        && target.departure_id == departure.id
+                                })
+                            });
+                            if !board_stop.allow_boarding && !chained_continuation {
+                                continue;
+                            }
+                            let connection_time = if chained_continuation {
+                                Duration::ZERO
+                            } else {
+                                transfer_time.unwrap_or_default()
+                            };
+                            let earliest_boarding = arrival.saturating_add(connection_time);
                             let boarding_time =
                                 departure.departure_time.saturating_add(board_offset);
                             if boarding_time < earliest_boarding {
@@ -2327,23 +2328,27 @@ impl TransitRoutingModule {
                                 } else {
                                     self.mode.external().to_owned()
                                 },
-                                transfer_before: transfer_time.map(|transfer_time| {
-                                    (
-                                        transfer_distance,
-                                        (transfer_distance * self.walk_distance_factor).ceil(),
-                                        transfer_time,
-                                    )
-                                }),
+                                transfer_before: (!chained_continuation)
+                                    .then_some(transfer_time)
+                                    .flatten()
+                                    .map(|transfer_time| {
+                                        (
+                                            transfer_distance,
+                                            (transfer_distance * self.walk_distance_factor).ceil(),
+                                            transfer_time,
+                                        )
+                                    }),
+                                chained_from_previous: chained_continuation,
                             });
                             let next_stop = alight_stop.facility_id.clone();
-                            let next_rides_used = rides_used + 1;
+                            let next_rides_used = rides_used
+                                + usize::from(current.rides.is_empty() || !chained_continuation);
                             let key = (next_stop.clone(), next_rides_used);
                             let candidate_state = TransitPathState {
                                 state_id: next_state_id,
                                 arrival: stop_arrival,
                                 cost: self.cost_equivalent_seconds(
                                     stop_arrival,
-                                    current.access_distance,
                                     &rides,
                                     departure_time,
                                     routing_params,
@@ -2378,6 +2383,68 @@ impl TransitRoutingModule {
         }
         candidates
     }
+}
+
+fn chained_departures_from<'a>(
+    schedule: &'a TransitSchedule,
+    rides: &[Ride],
+    boarding_stop: &Id<TransitStopFacility>,
+) -> Option<&'a [ChainedDeparture]> {
+    let Some(previous) = rides.last() else {
+        return None;
+    };
+    if &previous.alight != boarding_stop {
+        return None;
+    }
+    schedule
+        .get_line(&previous.line)
+        .routes
+        .get(&previous.route)
+        .and_then(|route| {
+            route
+                .departures
+                .iter()
+                .find(|candidate| candidate.id == previous.departure)
+        })
+        .map(|departure| departure.chained_departures.as_slice())
+}
+
+fn collapse_chained_rides(rides: &[Ride]) -> Vec<Ride> {
+    let mut collapsed: Vec<Ride> = Vec::with_capacity(rides.len());
+    for ride in rides {
+        if ride.chained_from_previous
+            && let Some(previous) = collapsed.last_mut()
+        {
+            previous.alight = ride.alight.clone();
+            previous.alight_index = ride.alight_index;
+            previous.alighting_time = ride.alighting_time;
+            previous.distance += ride.distance;
+        } else {
+            collapsed.push(ride.clone());
+        }
+    }
+    collapsed
+}
+
+fn transfer_count(rides: &[Ride]) -> usize {
+    rides
+        .iter()
+        .skip(1)
+        .filter(|ride| !ride.chained_from_previous)
+        .count()
+}
+
+fn chained_dwell_seconds(rides: &[Ride]) -> f64 {
+    rides
+        .windows(2)
+        .filter(|pair| pair[1].chained_from_previous)
+        .map(|pair| {
+            pair[1]
+                .boarding_time
+                .duration_since(pair[0].alighting_time)
+                .as_secs_f64()
+        })
+        .sum()
 }
 
 fn transit_path_tiebreak(left: &TransitPath, right: &TransitPath) -> std::cmp::Ordering {
@@ -2752,6 +2819,7 @@ mod route_proposal_tests {
             id: Id::create("late"),
             departure_time: SimTime::from_secs(9 * 3600),
             vehicle_ref_id: None,
+            chained_departures: Vec::new(),
             attributes: InternalAttributes::default(),
         }];
         let router = reference_router(schedule, 0.8333333333333334);
@@ -2815,6 +2883,7 @@ mod route_proposal_tests {
                 transport_mode: "train".to_string(),
                 passenger_mode: "pt".to_string(),
                 transfer_before: None,
+                chained_from_previous: false,
             };
         let cost_in_utils = |rides: &[Ride]| {
             let router = reference_router(reference_schedule(), 0.8333333333333334)
@@ -3270,6 +3339,7 @@ mod route_proposal_tests {
                 id: Id::create(id),
                 departure_time: SimTime::from_secs(time),
                 vehicle_ref_id: None,
+                chained_departures: Vec::new(),
                 attributes: InternalAttributes::default(),
             })
             .collect();
@@ -3377,6 +3447,7 @@ mod route_proposal_tests {
             transport_mode: "bus".to_string(),
             passenger_mode: "pt".to_string(),
             transfer_before: None,
+            chained_from_previous: false,
         };
         let crowded_first_segment = BTreeMap::from([(
             TransitSegment {
@@ -3426,6 +3497,7 @@ mod route_proposal_tests {
             id: Id::create("boundary"),
             departure_time: SimTime::from_secs(8 * 3600 + 11 * 60),
             vehicle_ref_id: None,
+            chained_departures: Vec::new(),
             attributes: InternalAttributes::default(),
         }];
         for construction in transfer_construction_modes() {
@@ -3589,6 +3661,7 @@ mod route_proposal_tests {
             id: Id::create("just-catch"),
             departure_time: SimTime::from_secs(8 * 3600 + 12 * 60 + 36),
             vehicle_ref_id: None,
+            chained_departures: Vec::new(),
             attributes: InternalAttributes::default(),
         }];
 

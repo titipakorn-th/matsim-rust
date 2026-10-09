@@ -282,6 +282,8 @@ The config must list the modes to route in `routing.network_modes` (for example 
 Without it no network router exists: QSim stops in prepare-for-sim for plans with network legs,
 and route requests for that mode fail with `invalid_request`. QSim also scores every plan, so
 `scoring` needs parameters for each activity type, mode, and subpopulation in the population.
+For PT route choice, passenger-mode utilities adjust ride time; access, transfer and egress walking,
+waiting, and transfer penalties keep their own costs.
 
 The protocol is line-delimited JSON: one request object per line, one response object per line.
 
