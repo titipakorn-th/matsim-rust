@@ -23,7 +23,7 @@ use matsim_rust::simulation::events::{
     VehicleArrivesAtFacilityEvent, VehicleDepartsAtFacilityEvent, VehicleEntersTrafficEvent,
     VehicleLeavesTrafficEvent,
 };
-use matsim_rust::simulation::id::Id;
+use matsim_rust::simulation::id::{self, Id};
 use matsim_rust::simulation::replanning::routing::{
     Facility, RoutingError, RoutingRequestBuilder, TransitRoutingModule, TransitSkimOutcome,
     TripRouter,
@@ -1228,6 +1228,103 @@ fn a_faster_shared_stop_transfer_beats_a_direct_service() {
     );
 }
 
+/// A linked departure removes the transfer penalty and keeps the passenger on one through ride.
+#[deterministic_id_test(matsim_rust)]
+fn chained_departure_is_one_onboard_ride() {
+    let fixture = "routing_chained_departure";
+    let request = load_request(fixture);
+    let config_path = format!("./tests/resources/pt_reference/{fixture}/config.yml");
+    let config = Config::from_args(CommandLineArgs::new_with_path(&config_path));
+    let reference = read_reference(fixture);
+    verify_same_conditions(&reference, &config);
+    let rust = calc_pt_route(&request, &run(config), None);
+    let expected = reference
+        .itineraries
+        .iter()
+        .find(|itinerary| itinerary["id"] == request["id"])
+        .expect("the request is recorded in the reference");
+
+    assert_eq!(
+        rides(&expected),
+        vec![
+            ride("a_to_b", "ra", "rb", 28800.0),
+            ride("b_to_c", "rb", "rc", 29700.0),
+            ride("c_to_d", "rc", "rd", 30300.0),
+        ],
+        "the pinned reference no longer follows the three linked services"
+    );
+    assert_eq!(arrival_time(&rust), arrival_time(&expected));
+    assert_eq!(expected["generalized_cost"].as_f64(), Some(6.0));
+    assert_eq!(
+        rides(&rust),
+        vec![ride("a_to_b", "ra", "rd", 28800.0)],
+        "Rust should expose one passenger ride across all linked route sections"
+    );
+    assert_eq!(rust["legs"].as_array().unwrap().len(), 3);
+}
+
+/// A faster service is unusable when boarding or alighting is forbidden at the transfer stop.
+#[deterministic_id_test(matsim_rust)]
+fn restricted_boarding_and_alighting_match_the_pinned_reference() {
+    let fixture = "routing_restricted_boarding_alighting";
+    let config_path = format!("./tests/resources/pt_reference/{fixture}/config.yml");
+    let load_config = || Config::from_args(CommandLineArgs::new_with_path(&config_path));
+    let config = load_config();
+    let reference = read_reference(fixture);
+    verify_same_conditions(&reference, &config);
+    let source_scenario = Scenario::load(load_config());
+    let serialized = tempfile::tempdir().unwrap();
+    let protobuf_network = serialized.path().join("network.binpb");
+    let protobuf_vehicles = serialized.path().join("vehicles.binpb");
+    let protobuf_schedule = serialized.path().join("schedule.binpb");
+    let roundtrip_schedule = serialized.path().join("schedule.xml");
+    let protobuf_ids = serialized.path().join("ids.binpb");
+    source_scenario.network.to_file(&protobuf_network);
+    source_scenario.garage.to_file(&protobuf_vehicles);
+    source_scenario.transit_schedule.to_file(&protobuf_schedule);
+    source_scenario
+        .transit_schedule
+        .to_file(&roundtrip_schedule);
+    id::store_to_file(&protobuf_ids);
+
+    let router = run(config);
+    let mut protobuf_config = load_config();
+    protobuf_config.network_mut().path = Some(protobuf_network);
+    protobuf_config.vehicles_mut().path = Some(protobuf_vehicles);
+    protobuf_config.transit_mut().schedule_path = Some(protobuf_schedule);
+    protobuf_config.ids_mut().path = Some(protobuf_ids);
+    let protobuf_router = run(protobuf_config);
+    let mut roundtrip_config = load_config();
+    roundtrip_config.transit_mut().schedule_path = Some(roundtrip_schedule);
+    let roundtrip_router = run(roundtrip_config);
+    let request = load_request(fixture);
+    let itinerary = calc_pt_route(&request, &router, None);
+    let protobuf_itinerary = calc_pt_route(&request, &protobuf_router, None);
+    let roundtrip_itinerary = calc_pt_route(&request, &roundtrip_router, None);
+    let expected = reference
+        .itineraries
+        .iter()
+        .find(|itinerary| itinerary["id"] == request["id"])
+        .expect("the restricted-stop request is recorded");
+
+    let expected_rides = vec![
+        ride("a_to_b_alighting_allowed", "ra", "rb", 28_800.0),
+        ride("b_to_c_boarding_allowed", "rb", "rc", 29_760.0),
+    ];
+    assert_eq!(rides(&itinerary), expected_rides);
+    assert_eq!(
+        protobuf_itinerary, itinerary,
+        "protobuf input changed the restricted route"
+    );
+    assert_eq!(
+        roundtrip_itinerary, itinerary,
+        "XML serialization changed the restricted route"
+    );
+    assert_eq!(rides(&itinerary), rides(expected));
+    assert_eq!(arrival_time(&itinerary), 30_360.0);
+    assert_eq!(arrival_time(&itinerary), arrival_time(expected));
+}
+
 /// A full first departure changes the next iteration's route on both implementations.
 #[deterministic_id_test(matsim_rust)]
 fn previous_iteration_crowding_changes_the_pinned_reference_itinerary() {
@@ -1546,12 +1643,32 @@ fn generated_intermodal_plan_executes_and_scores_its_feeder_legs() {
 /// A transfer between separate platforms retains the walk leg and its five-second safety margin.
 #[deterministic_id_test(matsim_rust)]
 fn a_distinct_platform_transfer_matches_the_pinned_reference() {
-    let config = Config::from_args(CommandLineArgs::new_with_path(
-        "./tests/resources/pt_reference/routing_distinct_platform_transfer/config.yml",
-    ));
+    let config_path =
+        "./tests/resources/pt_reference/routing_distinct_platform_transfer/config.yml";
+    let load_config = || Config::from_args(CommandLineArgs::new_with_path(config_path));
+    let config = load_config();
     let reference = read_reference("routing_distinct_platform_transfer");
     verify_same_conditions(&reference, &config);
+
+    let source_scenario = Scenario::load(load_config());
+    let serialized = tempfile::tempdir().unwrap();
+    let protobuf_network = serialized.path().join("network.binpb");
+    let protobuf_vehicles = serialized.path().join("vehicles.binpb");
+    let protobuf_schedule = serialized.path().join("schedule.binpb");
+    let protobuf_ids = serialized.path().join("ids.binpb");
+    source_scenario.network.to_file(&protobuf_network);
+    source_scenario.garage.to_file(&protobuf_vehicles);
+    source_scenario.transit_schedule.to_file(&protobuf_schedule);
+    id::store_to_file(&protobuf_ids);
+
     let router = run(config);
+    let mut protobuf_config = load_config();
+    protobuf_config.network_mut().path = Some(protobuf_network);
+    protobuf_config.vehicles_mut().path = Some(protobuf_vehicles);
+    protobuf_config.transit_mut().schedule_path = Some(protobuf_schedule);
+    protobuf_config.ids_mut().path = Some(protobuf_ids);
+    let protobuf_router = run(protobuf_config);
+    let repeated_router = run(load_config());
     for (index, expected_rides, end) in [
         (
             0,
@@ -1585,12 +1702,24 @@ fn a_distinct_platform_transfer_matches_the_pinned_reference() {
     ] {
         let request = load_request_at("routing_distinct_platform_transfer", index);
         let rust = calc_pt_route(&request, &router, None);
+        let protobuf = calc_pt_route(&request, &protobuf_router, None);
+        let repeated = calc_pt_route(&request, &repeated_router, None);
         let expected = reference
             .itineraries
             .iter()
             .find(|itinerary| itinerary["id"] == request["id"])
             .expect("the request is recorded in the reference");
         assert_eq!(rides(&rust), expected_rides);
+        assert_eq!(
+            protobuf, rust,
+            "protobuf inputs changed request {}",
+            request["id"]
+        );
+        assert_eq!(
+            repeated, rust,
+            "repeating the same seed changed request {}",
+            request["id"]
+        );
         assert_eq!(rides(&rust), rides(expected));
         assert_eq!(arrival_time(&rust), end);
         assert_eq!(arrival_time(&rust), arrival_time(expected));
@@ -1623,19 +1752,74 @@ fn a_distinct_platform_transfer_matches_the_pinned_reference() {
 /// A plan routed through separate platforms completes its walk and transit legs in QSim.
 #[deterministic_id_test(matsim_rust)]
 fn a_distinct_platform_transfer_executes_through_the_simulation_runner() {
-    let run_transfer = |num_parts, output_name: &str| {
-        let mut config = Config::from_args(CommandLineArgs::new_with_path(
-            "./tests/resources/pt_reference/routing_distinct_platform_transfer/execution.yml",
-        ));
+    let config_path =
+        "./tests/resources/pt_reference/routing_distinct_platform_transfer/execution.yml";
+    let load_config = || Config::from_args(CommandLineArgs::new_with_path(config_path));
+    let source_scenario = Scenario::load(load_config());
+    let serialized = tempfile::tempdir().unwrap();
+    let protobuf_network = serialized.path().join("network.binpb");
+    let protobuf_population = serialized.path().join("population.binpb");
+    let protobuf_vehicles = serialized.path().join("vehicles.binpb");
+    let protobuf_schedule = serialized.path().join("schedule.binpb");
+    let protobuf_ids = serialized.path().join("ids.binpb");
+    source_scenario.network.to_file(&protobuf_network);
+    source_scenario.population.to_file(&protobuf_population);
+    source_scenario.garage.to_file(&protobuf_vehicles);
+    source_scenario.transit_schedule.to_file(&protobuf_schedule);
+    id::store_to_file(&protobuf_ids);
+
+    let run_transfer = |num_parts, use_protobuf: bool, output_name: &str| {
+        let mut config = load_config();
         config.partitioning_mut().num_parts = num_parts;
         config.output_mut().analysis.enabled = true;
         config.output_mut().output_dir = Path::new("./test_output/simulation").join(output_name);
+        if use_protobuf {
+            config.network_mut().path = Some(protobuf_network.clone());
+            config.population_mut().path = Some(protobuf_population.clone());
+            config.vehicles_mut().path = Some(protobuf_vehicles.clone());
+            config.transit_mut().schedule_path = Some(protobuf_schedule.clone());
+            config.ids_mut().path = Some(protobuf_ids.clone());
+        }
         let output_dir = config.output().output_dir.clone();
-        run(config);
-        output_dir
+        let (_, population) = run_with_population(config);
+        (output_dir, population)
     };
-    let one_part = run_transfer(1, "pt_distinct_platform_execution_one_part");
-    let two_parts = run_transfer(2, "pt_distinct_platform_execution_two_parts");
+    let (one_part, one_part_population) =
+        run_transfer(1, false, "pt_distinct_platform_execution_one_part");
+    let (two_parts, two_parts_population) =
+        run_transfer(2, false, "pt_distinct_platform_execution_two_parts");
+    let (protobuf_one_part, protobuf_one_part_population) =
+        run_transfer(1, true, "pt_distinct_platform_execution_protobuf_one_part");
+    let (protobuf_two_parts, protobuf_two_parts_population) =
+        run_transfer(2, true, "pt_distinct_platform_execution_protobuf_two_parts");
+
+    let expected_events = normalize_partitioned_events(&one_part.join("events"), 1);
+    let expected_population = one_part_population;
+    for (format, num_parts, output_dir, population) in [
+        ("XML", 2, two_parts.clone(), two_parts_population),
+        (
+            "protobuf",
+            1,
+            protobuf_one_part,
+            protobuf_one_part_population,
+        ),
+        (
+            "protobuf",
+            2,
+            protobuf_two_parts,
+            protobuf_two_parts_population,
+        ),
+    ] {
+        assert_eq!(
+            normalize_partitioned_events(&output_dir.join("events"), num_parts),
+            expected_events,
+            "{format} input with {num_parts} partition(s) changed final passenger events"
+        );
+        assert_eq!(
+            population, expected_population,
+            "{format} input with {num_parts} partition(s) changed the final population"
+        );
+    }
 
     let events = normalize_events(&one_part.join("events/events.0.binpb"));
     let passenger_events: Vec<_> = events
@@ -2400,6 +2584,120 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
     );
     assert_eq!(
         calc_pt_route(&freight_request, &partitioned_router, Some(&freight)),
+        freight_route,
+        "partition changes should preserve the freight passenger's unique optimum"
+    );
+}
+
+/// Every other routing fixture varies one optional feature against a pinned reference. This one
+/// switches several of them on together — passenger mode mapping, person-specific scoring costs, a
+/// walking transfer between separate platforms, and a bounded transfer penalty — because features
+/// that each work alone can still interfere when combined.
+///
+/// The penalty is the point of the combination: it is charged on the transfer the freight
+/// subpopulation takes, and it is charged while that passenger's inverted mode utilities are the
+/// reason the transfer wins at all. The default subpopulation pays no penalty because it takes the
+/// direct service.
+#[deterministic_id_test(matsim_rust)]
+fn combined_optional_routing_features_compose_like_the_pinned_reference() {
+    let fixture = "routing_combined_features";
+    let config = Config::from_args(CommandLineArgs::new_with_path(&format!(
+        "./tests/resources/pt_reference/{fixture}/config.yml"
+    )));
+    let reference = read_reference(fixture);
+    verify_same_conditions(&reference, &config);
+    let router = run(config);
+
+    let default_request = load_request_at(fixture, 0);
+    let freight_request = load_request_at(fixture, 1);
+    let internal_person = |request: &Value| {
+        let person = &request["person"];
+        InternalPerson::new(
+            Id::create(person["id"].as_str().unwrap()),
+            InternalPlan {
+                score: None,
+                selected: true,
+                elements: Vec::new(),
+                attributes: InternalAttributes::default(),
+            },
+        )
+        .with_subpopulation(person["subpopulation"].as_str().unwrap())
+    };
+    let default_person = internal_person(&default_request);
+    let freight_person = internal_person(&freight_request);
+    let reference_itinerary = |id: &str| {
+        reference
+            .itineraries
+            .iter()
+            .find(|itinerary| itinerary["id"] == id)
+            .unwrap_or_else(|| panic!("the reference is missing request {id}"))
+    };
+
+    let default_route = calc_pt_route(&default_request, &router, Some(&default_person));
+    let freight_route = calc_pt_route(&freight_request, &router, Some(&freight_person));
+
+    // Mode mapping is what puts these passenger modes on the rides at all: the schedule carries
+    // `train` and `bus`, and neither is a transit passenger mode in this configuration.
+    assert_eq!(
+        rides(&default_route),
+        vec![ride("direct", "ra", "rc", 28_800.0)],
+        "the default subpopulation takes the direct rail service and pays no transfer penalty"
+    );
+    assert_eq!(
+        rides(&freight_route),
+        vec![
+            ride("a_to_b", "ra", "rb", 28_800.0),
+            ride("b_to_c_bus", "rb_platform", "rc", 29_700.0),
+        ],
+        "the freight subpopulation takes the transfer, walking between separate platforms"
+    );
+    // The walking transfer between `rb` and `rb_platform` is the fourth feature: it is a leg of its
+    // own, and its beeline-adjusted 130 m and the pinned five-second margin before boarding both
+    // have to survive the combination.
+    assert!(
+        freight_route["legs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|leg| leg["mode"] == "walk"
+                && leg["distance"] == 130.0
+                && leg["arrival_time"].as_f64().unwrap() - leg["departure_time"].as_f64().unwrap()
+                    == 151.0),
+        "the walking transfer between separate platforms is missing from the freight itinerary"
+    );
+
+    let default_expected =
+        reference_itinerary("default_subpopulation_takes_the_direct_rail_service");
+    let freight_expected = reference_itinerary("freight_subpopulation_takes_the_walked_transfer");
+    assert_eq!(rides(&default_route), rides(default_expected));
+    assert_eq!(rides(&freight_route), rides(freight_expected));
+    assert_eq!(arrival_time(&default_route), arrival_time(default_expected));
+    assert_eq!(arrival_time(&freight_route), arrival_time(freight_expected));
+
+    // The two subpopulations disagree on the same schedule, request and seed, so the combination is
+    // not silently collapsing to one preference for everybody.
+    assert_ne!(rides(&default_route), rides(&freight_route));
+
+    // Composition is not a one-shot result: the same requests must keep their choices when the
+    // request is repeated and when the network is partitioned differently.
+    assert_eq!(
+        calc_pt_route(&freight_request, &router, Some(&freight_person)),
+        freight_route,
+        "repeating the same request should preserve its unique optimum"
+    );
+    let mut partitioned_config = Config::from_args(CommandLineArgs::new_with_path(&format!(
+        "./tests/resources/pt_reference/{fixture}/config.yml"
+    )));
+    partitioned_config.partitioning_mut().num_parts = 2;
+    partitioned_config.output_mut().output_dir.push("two_parts");
+    let partitioned_router = run(partitioned_config);
+    assert_eq!(
+        calc_pt_route(&default_request, &partitioned_router, Some(&default_person)),
+        default_route,
+        "partition changes should preserve the default passenger's unique optimum"
+    );
+    assert_eq!(
+        calc_pt_route(&freight_request, &partitioned_router, Some(&freight_person)),
         freight_route,
         "partition changes should preserve the freight passenger's unique optimum"
     );

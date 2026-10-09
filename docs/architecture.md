@@ -104,6 +104,10 @@ This feedback cost is a Rust extension rather than an exact port of MATSim 2026.
 windows to exclude departures after failed boarding; it does not add these occupancy and headway
 costs.
 
+PT route-choice costs also apply each passenger-mode utility adjustment to in-vehicle ride time only.
+Access, transfer and egress walking, waiting, and transfer penalties remain separate components of
+the itinerary cost; a mode-specific ride utility does not reprice those components.
+
 Worker extensions can observe state moving between partitions through a fourth, thread-local
 `PartitionChangeExtensionsManager` bus alongside the simulation-event, Mobsim-lifecycle, and partition-event buses.
 When a vehicle or teleporting agent leaves a partition, the bus moves one typed attachment slot per registered

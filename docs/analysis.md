@@ -308,6 +308,10 @@ capacity source: a departure's `vehicleRefId` is looked up in it, and the vehicl
 `<capacity>` (seats plus standing room) is the capacity. Both XML and protobuf vehicle files
 carry it.
 
+These reports describe Rust simulation outputs. The focused Java differential fixtures compare only
+their documented itinerary, event and execution fields; they do not establish full-scale or
+byte-identical parity for analysis tables. See [the fixture scope](pt_java_reference.md).
+
 `transit_trips.csv` has one row per passenger transit leg. `service_modeling` is `simulated`
 for a leg with a service record and `unrecorded` otherwise. `outcome` is `boarded`,
 `missed_service` (the service record's boarding time precedes the passenger's departure, so the

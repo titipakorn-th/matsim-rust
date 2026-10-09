@@ -153,6 +153,30 @@ cost. The pinned Java and Rust routers choose the direct service, arrive at 08:5
 ride as a `rail` leg. This complements the preceding fixture, which checks route selection with
 mapping disabled.
 
+### `routing_combined_features`
+
+This combines passenger mode mappings, subpopulation-specific mode utilities, a walk between
+separate transfer platforms, and the bounded transfer penalty. The default subpopulation takes the
+direct rail service; freight takes the faster rail–bus transfer, including the 130 m walk and
+five-second boarding margin. Mode utility applies to ride time, while transfer walking and waiting
+remain at the baseline PT cost.
+
+### `routing_restricted_boarding_alighting`
+
+Two faster transfer options are independently blocked: one route cannot alight at `rb`, and another
+cannot board there. If either stop restriction is ignored, its faster transfer beats the valid
+alternative. MATSim and Rust choose the slower transfer whose boarding and alighting are both
+allowed, so the selected service sequence checks both flags rather than merely checking that a route
+exists.
+
+### `routing_chained_departure`
+
+The 08:00 service from `ra` reaches `rb`, then continues as the linked 08:15 service to `rc` and the
+linked 08:25 service to `rd`. Both continuation routes forbid boarding at their first stop, so a
+normal transfer cannot use them. The 08:15 departure also links to a later route ending at `re`; a
+request to `rd` must follow the matching branch. MATSim returns three route sections; Rust reports
+one through ride, arriving at 08:35 without counting either linked dwell as a transfer.
+
 ### `routing_distinct_platform_transfer`
 
 Two requests transfer between `rb` and `rb_platform`, separate facilities 100 m apart. The 08:00
@@ -162,7 +186,10 @@ default walking transfer. The reachable requests compete with direct service und
 route-cost objective. Their itineraries include the transfer walk, its 130 m beeline-adjusted
 distance, and the pinned five-second transfer-walk margin. A separate Rust runner config supplies
 a person plan so the generated access, transfer and egress legs execute in QSim; the routing test
-also round-trips that itinerary through XML and protobuf population files.
+also round-trips that itinerary through XML and protobuf population files. It rebuilds the routing
+scenario from protobuf inputs and repeats the same-seed request, then compares the full itinerary
+with the XML result. The execution test runs XML and protobuf input bundles with one and two
+partitions and compares normalized passenger events and the final population.
 
 ### `routing_intermodal_access_egress`
 
@@ -369,6 +396,47 @@ Recorded from the pinned checkout, for scoping the port. Sources are under
 | No schedule repetition after 24 h | `SwissRailRaptor.calcRoute` | `SwissRailRaptorTest.testAfterMidnight` |
 | Determinism | — | `RaptorDeterminismTest` |
 
+### Rust comparison status
+
+Tags describe the strength of the Rust evidence: **Java differential** means the named fixture compares
+Rust output with the pinned MATSim recording; **Rust-only** means the behavior has tests but no
+Java comparison; **partial** means only the named cases are covered; **deviation** records known
+behavioral differences. This is a fixture inventory, not a claim that every MATSim option is ported.
+
+| Feature group | Tag | Rust evidence or remaining limit |
+|---|---|---|
+| Least-cost one-to-one and passenger mode mapping | Java differential | `routing_direct_vs_transfer`, `routing_mapped_modes`, `routing_combined_features` |
+| One-to-all trees and observable departures | Java differential | `routing_direct_vs_transfer`; reachable, unreachable and isolated stops |
+| Departure windows and no service after the final departure | Partial | `routing_range_boundaries`; direct-walk wrapper fallback remains a known deviation |
+| Configurable route selectors and equal-cost tie-breaks | Partial | Default route choices are compared; Java differentials for non-default selector weights, `maxTransfers`, `exactDeparturesOnly`, `useTransportModeUtilities`, and Java RNG stream equivalence are not established |
+| Transfer construction modes | Partial | Initial is the reference mode; Adaptive and Online are compared Rust-side; Online is a Rust extension |
+| Default transfer cost and transfer margins | Java differential | `routing_transfer_penalty_shared_stop`, `queue_missed_connection`, `routing_distinct_platform_transfer` |
+| Mode-pair transfer costs | Deviation | `routing_transfer_penalty_mode_to_mode` matches selected itinerary and arrival but generalized cost differs; incremental Java accounting and `ModeSpecificTransferCostCalculator` clamping are not ported or differentially verified |
+| Distinct-stop walking transfers | Java differential | `routing_distinct_platform_transfer`, `routing_combined_features` |
+| Stop radius, eligibility and link filters | Partial | `routing_intermodal_eligibility`, `routing_intermodal_unavailable_feeder`; a feeder returning `NoPath` is Rust-unit-tested only |
+| Intermodal access and egress | Java differential | `routing_intermodal_access_egress`, `routing_intermodal_eligibility`, `routing_intermodal_unavailable_feeder` |
+| Person-specific mode utilities | Java differential | `routing_person_specific_costs`, `routing_combined_features` |
+| Capacity-aware route choice | Deviation | `capacity_feedback` compares the resulting choice; Rust occupancy/headway costs differ from Java's failed-boarding window exclusion |
+| Chained departures | Java differential, partial | `routing_chained_departure` verifies two successive linked service sections and a two-way branch to distinct destinations, including no-boarding stops; XML and protobuf preserve references. Larger chained graphs and split/merge execution are not covered |
+| Restricted boarding and alighting | Java differential | `routing_restricted_boarding_alighting`; each forbidden route would otherwise beat the valid transfer |
+| Next-day schedule repetition | Rust-only | A routing unit test checks no service at 24:00 and a real service at 25:00; no pinned Java fixture covers it |
+| Same-seed repeatability and partition stability | Java differential / Rust parity | Requests repeat with the recorded seed; `routing_person_specific_costs` and `routing_combined_features` check routing choices across partitions; `routing_distinct_platform_transfer` compares XML/protobuf decisions and same-seed repeats, plus execution final state across one/two partitions |
+
+### Execution
+
+| Feature group | Tag | Rust evidence or remaining limit |
+|---|---|---|
+| Supplied-plan activity and leg execution | Java differential | `supplied_plan`; event identities and times are exact |
+| Queue transit boarding, alighting and capacity | Java differential | `queue_execution`, `queue_stranded`; one-seat denial and abort outcomes are covered across partitions |
+| Missed transfer connections | Java differential | `queue_missed_connection`; event differences are bounded to two seconds |
+| Road traffic competing with transit | Partial | `queue_road_baseline`, `queue_road_congestion`; bus delay agrees within two seconds for the pinned link and vehicle types |
+| Serial and parallel vehicle doors | Java differential | `queue_doors_serial`, `queue_doors_parallel`; passenger order and stop dwell are compared |
+| Mixed timetable and queue engines | Java differential, one/two partitions | `timetable_mixed`; the two-partition test forces one train link transition across the partition boundary |
+| Timetable link and traffic events | Java differential | `timetable_link_events`; event identities, links and times are compared within the documented clock tolerance |
+
+These tags summarize the pinned fixture corpus and leave small-fixture and untested-option limits
+visible.
+
 Not covered by an upstream test in the pinned tree, so not evidence of intended behavior:
 `RaptorTransferCalculation.{Adaptive,Online}`, `maxTransfers`, `exactDeparturesOnly`,
 `useTransportModeUtilities`, the `LeastCostRaptorRouteSelector` tie-break, and
@@ -408,8 +476,9 @@ and event times against the pinned SBB engine.
 
 The `timetable_mixed` fixture runs the supplied plans with `train` services on the SBB timetable
 engine and `pt` services on the queue network engine. Rust selects SBB-style runs with
-`transit.deterministic_service_modes`; those runs keep their event state on the single worker and
-use the scheduled stop offsets while reusing the queue engine's passenger capacity and stop queues.
-This path currently requires one partition. Cross-partition timetable service is tracked separately.
+`transit.deterministic_service_modes`; those runs use the scheduled stop offsets while reusing the
+queue engine's passenger capacity and stop queues. The reference suite runs the fixture with one
+partition and a targeted two-partition variant that forces one train link transition across a
+partition boundary. That covers this handoff case, not arbitrary partition layouts or routes.
 The fixture compares train and passenger event times within one second; the queue bus's final stop
 allows two seconds for accumulated link/node phases, as the bus remains road-driven.
