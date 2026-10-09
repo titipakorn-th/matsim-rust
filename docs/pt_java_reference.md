@@ -232,16 +232,48 @@ given a per-travel-time-hour cost; the Rust config rejects that combination rath
 of them silently.
 
 This fixture records a **known deviation in the route cost**. The selected route, its rides and its
-arrival time all match; the recorded `generalized_cost` does not: Java reports 9.0 utils where Rust
-reports 6.0. `ModeSpecificTransferCostCalculator` ignores its `existingTransferCosts` argument and
-returns the whole per-transfer cost, which `SwissRailRaptorCore` then re-adds as it walks the path,
-so the reference's transfer cost depends on how many path elements it visits. The Rust router charges
-one clipped cost per transfer instead, which is the behaviour the calculator's own contract describes.
-Neither one cost per transfer nor a guessed re-adding rule reproduces 9.0, so the gap is pinned in
-`java_reference.rs` rather than papered over; closing it means porting MATSim's incremental transfer
-accounting. `routing_transfer_penalty_shared_stop` demonstrates the costs agreeing exactly where the
-route has no transfers, which shows the utils conversion itself is sound and the deviation is specific
-to mode-specific penalties.
+arrival time all match; the recorded `generalized_cost` does not: Java reports 9.0 utils where Rust's
+route costs 6.0.
+
+The whole gap is 3.0 utils. Instrumenting `calcTransferCost` during a run of this fixture
+decomposes both totals exactly:
+
+| component | Rust | MATSim |
+|---|---|---|
+| in-vehicle time, transfer walk and waiting time | 5.0 | 5.0 |
+| the one real `train` → `train` transfer | 1.0 | 1.0 |
+| **a stale `train` → `bus` charge** | — | 3.0 |
+| total | **6.0** | **9.0** |
+
+Both sides price the real transfer identically: `transferPenaltyFixCostPerTransfer` is 1.0, which
+`RaptorUtils.createParameters` derives from `utilityOfLineSwitch`, and no `train` → `train` mode pair is
+configured, so the mode-specific offset contributes nothing. Rust's `TransitTransferPenalty::base_cost`
+applies the same fallback. The 5.0 of time is the 600 s on `a_to_b`, the 156 s walk to `rb_platform`,
+144 s of waiting and the 600 s on `b_to_c`, each at the pinned 12 utils/h minus 6 utils/h performing,
+which is 1500 s at the module's 300 s per utility.
+
+The 3.0 MATSim adds on top is an upstream defect, not a different accounting convention.
+`CachingTransferProvider` (`SwissRailRaptorData`) holds a single mutable `raptorTransfer` field. Only
+`handleTransfers` ever updates it, via `reset(transfer)` at `SwissRailRaptorCore:925`. `exploreRoute`
+reads that same provider at `SwissRailRaptorCore:741` to price the arrival at every route stop past the
+first boarding, and never resets it first. So the arrival at `rc` on a `train` → `train` journey is
+priced by whatever transfer `handleTransfers` happened to leave behind — here the `train` → `bus`
+transfer, worth 1.0 plus the configured 2.0.
+`ModeSpecificTransferCostCalculator` ignores its `existingTransferCosts` argument and returns the whole
+per-transfer cost, which makes that stale value additive; the `DefaultRaptorTransferCostCalculator`
+subtracts `existingTransferCosts`, so the same stale read cancels and the shared-stop fixture is
+unaffected.
+
+The consequence is that the reference's transfer cost is a property of MATSim's round ordering, not of
+the itinerary: the same journey priced from a different search order would report a different number.
+Rust therefore cannot reproduce 9.0 without mirroring MATSim's internal search order, which is outside
+the comparison boundary this harness sets. Rust charges one clipped cost per transfer, which is what
+`ModeSpecificTransferCostCalculator`'s contract describes.
+
+Both numbers are pinned in `java_reference.rs` so the gap stays visible and cannot drift silently.
+`routing_transfer_penalty_shared_stop` demonstrates the costs agreeing exactly under the default
+calculator, which shows the conversion and the time component are sound and isolates the deviation to
+the stale mode-specific charge.
 
 ### `routing_range_boundaries`
 
@@ -482,3 +514,48 @@ partition and a targeted two-partition variant that forces one train link transi
 partition boundary. That covers this handoff case, not arbitrary partition layouts or routes.
 The fixture compares train and passenger event times within one second; the queue bus's final stop
 allows two seconds for accumulated link/node phases, as the bus remains road-driven.
+
+## User Story Coverage
+
+Summary of all 38 user stories from [#69](https://github.com/titipakorn-th/matsim-rust/issues/69):
+
+| # | User Story | Status | Implementation & Evidence |
+|---|---|---|---|
+| 1 | Transit itineraries match pinned Java reference | Implemented | `tests/java_reference.rs` (`a_faster_shared_stop_transfer_beats_a_direct_service`, `:1166`, `:1548`, `:2287`, `:2323`, `:2412`) |
+| 2 | Direct vs transfer compete on routing cost | Implemented | `tests/java_reference.rs:1166`, `routing/mod.rs:1723-1786` |
+| 3 | Bus-to-rail transfers | Implemented | `tests/java_reference.rs:1548`, `routing/mod.rs:3207` |
+| 4 | Rail-to-rail transfers | Implemented | `tests/java_reference.rs:1548` (`b_to_c` at `rb_platform`) |
+| 5 | Walking transfers between separate stop facilities | Implemented | `routing/mod.rs:1641-1714` (`nearby_transfer_stops`), `tests/java_reference.rs:1618` |
+| 6 | Java-compatible transfer timing and margins | Implemented | `routing/mod.rs:686-687` (`RAPTOR_MIN_TRANSFER_TIME=60s`, `margin=5s`), `tests/java_reference.rs:1616-1639`, `:3403`, `:3568` |
+| 7 | Walking access and egress | Implemented | `routing/mod.rs:1191-1203`, `:1252-1258`, `:1460-1468` |
+| 8 | Configured intermodal access and egress | Implemented | `config.rs:579-585`, `routing/mod.rs:858-1027`, `tests/java_reference.rs:1267`, `:1512` |
+| 9 | Person and stop filters for intermodal access | Implemented | `routing/mod.rs:893-913`, `:1577-1610`, `tests/java_reference.rs:1410` |
+| 10 | Different costs per transit passenger mode | Implemented | `routing/mod.rs:1756-1785`, `tests/java_reference.rs:2287` (`routing_mapped_modes`) |
+| 11 | Person-specific routing costs | Implemented | `routing/mod.rs:494-505`, `:638-682`, `tests/java_reference.rs:2323` (`routing_person_specific_costs`) |
+| 12 | Configurable transfer costs | Implemented | `config.rs:611-636`, `:869`, `:894`, `routing/mod.rs:1859-1905`, `tests/java_reference.rs:1347` |
+| 13 | Mode-to-mode transfer penalties | Implemented | `config.rs:623-636`, `routing/mod.rs:1875-1887`, `tests/java_reference.rs:1367`; route selection matches Java; 3.0 cost gap proved to be Java `CachingTransferProvider` stale read bug and documented above |
+| 14 | Departure-window searches and route selection | Implemented | `routing/mod.rs:1907-2006`, `config.rs:729-747`, `tests/java_reference.rs:2412` |
+| 15 | Subpopulation-specific range settings | Implemented | `routing/mod.rs:612-629`, `config.rs:699`, `:735`, `routing/mod.rs:4526` |
+| 16 | Reference transfer-construction modes | Implemented | `config.rs:650-660`, `routing/mod.rs:1641-1661`, `:3513`; Online is a documented Rust extension |
+| 17 | One-to-all routing + observable routing results | Implemented | `routing/mod.rs:1419-1477`, `tests/java_reference.rs:2193-2271` (`calcTreesObservable`) |
+| 18 | Capacity-aware feedback from completed iterations | Implemented | `pt/feedback.rs:33-50`, `routing/mod.rs:1748-1845`, `controller/controller.rs:723`, `tests/java_reference.rs:1233`; documented Rust extension |
+| 19 | Actual boarding capacity enforcement | Implemented | `pt/driver.rs:281-300`, `:396`, `tests/java_reference.rs:138` |
+| 20 | Boarding, alighting and dwell Java-compatible | Implemented | `pt/doors.rs:74-138`, `pt/driver.rs:301-352`, `tests/java_reference.rs:860-880` |
+| 21 | Queue-based buses interact with road traffic | Implemented | `tests/java_reference.rs:1064`, `docs/architecture.md:80-82` |
+| 22 | Timetable-driven services selected by schedule mode | Implemented | `config.rs:563`, `pt/runs.rs:196-201`, `:265-294`, `engines/timetable_transit_engine.rs:94-146`, `tests/java_reference.rs:148` |
+| 23 | Configured events for timetable-driven vehicles | Implemented | `config.rs:566`, `engines/timetable_transit_engine.rs:99-102`, `:186-247`, `tests/java_reference.rs:415` |
+| 24 | Mixed execution journeys across partitions | Implemented | `tests/java_reference.rs:148-155`, `engines/timetable_transit_engine.rs:216-247` |
+| 25 | Missing services and stranded passengers handled explicitly | Implemented | `pt/runs.rs:168-173`, `:236-240`, `:307-320`, `:346-356`, `tests/simulation/pt.rs:39`, `tests/java_reference.rs:731` |
+| 26 | Departures beyond 24 h + final scheduled departure | Implemented | `routing/mod.rs:3739-3803`, `tests/java_reference.rs:2440-2462` |
+| 27 | Car fallback restricted to declared car owners | Implemented | `routing/mod.rs:451` (`OWNS_CAR`), `:788-806`, `:1099-1120`, `:4335`, `:4493` |
+| 28 | Missing ownership prohibits car fallback | Implemented | `routing/mod.rs:1110`, `:4351`, `:4366`, `:4383` |
+| 29 | Personless PT queries return PT/walk/no-path | Implemented | `routing/mod.rs:572-588` (`TransitSkimOutcome`), `silo_routing.rs:229-245`, `:366`, `:391`, `:428` |
+| 30 | SILO legacy car fallback explicit and separate | Implemented | `config.rs:577`, `routing/mod.rs:1032-1035`, `tests/silo_routing.rs:469` |
+| 31 | Boardings and alightings by train line and stop | Implemented | `analysis/transit.rs:801`, `:894-909`, `tests/java_reference.rs:334-380` |
+| 32 | Departure-segment occupancy incl. through passengers | Implemented | `analysis/transit.rs:802`, `:885-890`, `:1076-1112` |
+| 33 | Journey access, egress, waiting and transfer measures | Implemented | `analysis/transit.rs:803`, `:1116-1213`, `tests/java_reference.rs:1692-1704` |
+| 34 | Stop-level counts support station aggregation + sample expansion | Implemented | `analysis/transit.rs:822`, `:894-909`, `:1298-1314`, `:1405`, `tests/java_reference.rs:1722-1744` |
+| 35 | Repeatable stochastic choices across partitions | Implemented | `routing/mod.rs:876-880`, `:2000-2005`, `:4654`, `tests/java_reference.rs:2380-2405` |
+| 36 | XML and protobuf inputs produce equivalent decisions and state | Implemented | `routing/mod.rs:3703-3711`, `:3748-3780`, `:4164-4220` |
+| 37 | Runnable differential fixtures at public boundaries | Implemented | `java_reference/run_reference.sh`, 21 recorded references, `tests/java_reference.rs` |
+| 38 | Staged delivery with explicit feature coverage | Implemented | Detailed inventory and user story coverage matrix in `docs/pt_java_reference.md` |
