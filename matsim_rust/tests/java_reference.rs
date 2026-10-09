@@ -1382,14 +1382,13 @@ fn a_mode_to_mode_penalty_replaces_the_bus_transfer_with_the_rail_transfer() {
     );
 
     // KNOWN DEVIATION: the selected route, its rides and its arrival all match, but the recorded
-    // route cost does not. MATSim's ModeSpecificTransferCostCalculator ignores its
-    // `existingTransferCosts` argument and returns the whole per-transfer cost, which
-    // SwissRailRaptorCore then re-adds while walking the path; this router charges one cost per
-    // transfer. The two numbers are pinned so the gap stays visible and cannot drift silently.
-    // `routing_transfer_penalty_shared_stop` shows the costs agreeing exactly where the route has
-    // no transfers, so the conversion itself is sound and this is specific to mode-specific
-    // penalties. Closing the gap means porting MATSim's incremental transfer accounting; see
-    // docs/pt_java_reference.md.
+    // route cost does not. Both sides agree on 5.0 of travel and 1.0 for the one real
+    // `train`->`train` transfer; MATSim's extra 3.0 is a stale read, because `exploreRoute`
+    // prices each arrival through a `CachingTransferProvider` that only `handleTransfers` ever
+    // resets (SwissRailRaptorCore:741 reads it, :925 resets it). This arrival is therefore
+    // priced by the `train`->`bus` transfer left over from the previous round, which makes the
+    // number a property of MATSim's search order rather than of the itinerary. See
+    // docs/pt_java_reference.md for the full decomposition.
     assert_eq!(
         expected["generalized_cost"].as_f64(),
         Some(9.0),
@@ -2146,10 +2145,14 @@ fn arrival_time(itinerary: &Value) -> f64 {
         .unwrap_or_else(|| panic!("{itinerary} has no arrival time"))
 }
 
-/// Rust prices a route in seconds: the elapsed time plus one utility (300 s at MATSim's pinned
-/// defaults) per transfer. MATSim records its cost in utils, and at those defaults pt time costs
-/// 12 utils per hour, so the conversion is exact. `docs/pt_java_reference.md` states this
-/// conversion as the rule for comparing the two.
+/// Converts a Rust itinerary to MATSim's utility units for comparison: the elapsed time plus a flat
+/// 300 s per transfer, priced at MATSim's pinned 12 utils per hour.
+///
+/// The flat charge is MATSim's `transferPenaltyFixCostPerTransfer` of 1.0 utils, which every
+/// calculator here derives from `utilityOfLineSwitch`, so this matches Rust's own cost on all three
+/// cost fixtures. It does not model a per-mode-pair offset on top;
+/// `a_mode_to_mode_penalty_replaces_the_bus_transfer_with_the_rail_transfer` is the case where that
+/// matters. `docs/pt_java_reference.md` states the conversion as the comparison rule.
 fn rust_cost_utils(itinerary: &Value, request: &Value) -> f64 {
     let transfers = rides(itinerary).len().saturating_sub(1) as f64;
     let seconds =

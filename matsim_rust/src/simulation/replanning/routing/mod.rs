@@ -3736,6 +3736,45 @@ mod route_proposal_tests {
     }
 
     #[deterministic_id_test]
+    fn xml_and_protobuf_schedule_inputs_produce_identical_routing_decisions() {
+        let xml_schedule = reference_schedule();
+        let directory = tempfile::tempdir().unwrap();
+        let proto_path = directory.path().join("schedule.binpb");
+        xml_schedule.to_file(&proto_path);
+        let proto_schedule = TransitSchedule::from_file(&proto_path);
+
+        let xml_router = reference_router(xml_schedule, 0.8333333333333334);
+        let proto_router = reference_router(proto_schedule, 0.8333333333333334);
+
+        let access = [(Id::create("ra"), 0.0)];
+        let egress = HashSet::from([Id::create("rc")]);
+        let destination = Coordinate::new_2d(3950.0, 1050.0);
+        let departure = SimTime::from_secs(8 * 3600);
+
+        let xml_params = xml_router.resolve_routing_params("");
+        let proto_params = proto_router.resolve_routing_params("");
+
+        let xml_path = xml_router
+            .find_best_path(&destination, departure, &access, &egress, &xml_params)
+            .unwrap();
+        let proto_path = proto_router
+            .find_best_path(&destination, departure, &access, &egress, &proto_params)
+            .unwrap();
+
+        assert_eq!(xml_path.departure, proto_path.departure);
+        assert_eq!(xml_path.arrival, proto_path.arrival);
+        assert_eq!(xml_path.rides.len(), proto_path.rides.len());
+        for (xml_ride, proto_ride) in xml_path.rides.iter().zip(&proto_path.rides) {
+            assert_eq!(xml_ride.line, proto_ride.line);
+            assert_eq!(xml_ride.route, proto_ride.route);
+            assert_eq!(xml_ride.board, proto_ride.board);
+            assert_eq!(xml_ride.alight, proto_ride.alight);
+            assert_eq!(xml_ride.boarding_time, proto_ride.boarding_time);
+            assert_eq!(xml_ride.alighting_time, proto_ride.alighting_time);
+        }
+    }
+
+    #[deterministic_id_test]
     fn final_departure_is_available_but_schedule_does_not_repeat_after_24_hours() {
         let router = reference_router(reference_schedule(), 0.8333333333333334);
         let access_stops = [(Id::create("ra"), 0.0)];
