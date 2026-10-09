@@ -161,6 +161,7 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     config.partitioning_mut().num_parts = num_parts;
     config.output_mut().output_dir =
         Path::new("./test_output/simulation").join(format!("pt_timetable_mixed_{num_parts}_parts"));
+    config.output_mut().analysis.enabled = true;
     let output_dir = config.output().output_dir.clone();
     let reference = read_reference("timetable_mixed");
     verify_same_conditions(&reference, &config);
@@ -291,6 +292,36 @@ fn assert_timetable_train_and_queue_bus_matches_reference(num_parts: u32) {
     assert!(
         rust.iter()
             .any(|event| event["type"] == "stuckAndAbort" && event["person"] == "stranded-at-end")
+    );
+
+    // The Java event comparison above validates each passenger ride before checking these
+    // individual trip and complete-journey report rows.
+    let report = output_dir.join("analysis");
+    let trips = std::fs::read_to_string(report.join("transit_trips.csv")).unwrap();
+    assert_eq!(trips.matches("train-to-bus-transfer").count(), 2, "{trips}");
+    for (person, vehicle) in [
+        ("capacity-a", "train-0800"),
+        ("capacity-b", "train-0750"),
+        ("train-to-bus-transfer", "train-0730"),
+        ("train-to-bus-transfer", "bus-0740"),
+    ] {
+        assert!(
+            trips.lines().any(|line| {
+                line.starts_with(&format!("\"{person}\""))
+                    && line.contains(&format!("\"{vehicle}\""))
+                    && line.contains(",boarded,")
+            }),
+            "missing report row for {person} on {vehicle}: {trips}"
+        );
+    }
+    let journeys = std::fs::read_to_string(report.join("transit_journeys.csv")).unwrap();
+    assert!(
+        journeys.lines().any(|line| {
+            line.starts_with("\"train-to-bus-transfer\",0,")
+                && line.contains(",2,1,")
+                && line.ends_with(",complete")
+        }),
+        "{journeys}"
     );
 }
 
