@@ -158,10 +158,10 @@ mod tests {
         let link = |id: &str| Id::<Link>::create(id);
         let time = SimTime::from_secs;
 
-        let engine = Rc::new(RefCell::new(BackpackingEngine::new(vec![
-            driver.clone(),
-            passenger.clone(),
-        ])));
+        let engine = Rc::new(RefCell::new(BackpackingEngine::new(
+            vec![driver.clone(), passenger.clone()],
+            Arc::new(TransitVehicleRuns::default()),
+        )));
         let mut events = EventsManager::new();
         BackpackingEngine::register_event_handlers(engine.clone(), &mut events);
         events.reset_iteration(0);

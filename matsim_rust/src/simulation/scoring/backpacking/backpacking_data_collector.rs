@@ -7,11 +7,13 @@ use crate::simulation::events::{
 };
 use crate::simulation::id::Id;
 use crate::simulation::messaging::partition_change::PartitionChangeEntity;
+use crate::simulation::pt::runs::TransitVehicleRuns;
 use crate::simulation::scenario::population::InternalPerson;
 use crate::simulation::scenario::vehicles::InternalVehicle;
 use crate::simulation::scoring::backpacking::backpack::{Backpack, PersonExperience};
 use crate::simulation::scoring::partial_plans::PartialPlan;
 use nohash_hasher::{IntMap, IntSet};
+use std::sync::Arc;
 
 pub(crate) struct BackpackingAttachment {
     backpacks: Vec<Backpack>,
@@ -19,16 +21,23 @@ pub(crate) struct BackpackingAttachment {
 
 pub struct BackpackingDataCollector {
     home_person_ids: Vec<Id<InternalPerson>>,
+    transit_runs: Arc<TransitVehicleRuns>,
     person_id2backpack: IntMap<Id<InternalPerson>, Backpack>,
     vehicle_id2person_ids: IntMap<Id<InternalVehicle>, IntSet<Id<InternalPerson>>>,
+    person_id2vehicle_id: IntMap<Id<InternalPerson>, Id<InternalVehicle>>,
 }
 
 impl BackpackingDataCollector {
-    pub fn new(home_person_ids: Vec<Id<InternalPerson>>) -> Self {
+    pub fn new(
+        home_person_ids: Vec<Id<InternalPerson>>,
+        transit_runs: Arc<TransitVehicleRuns>,
+    ) -> Self {
         Self {
             home_person_ids,
+            transit_runs,
             person_id2backpack: Default::default(),
             vehicle_id2person_ids: Default::default(),
+            person_id2vehicle_id: Default::default(),
         }
     }
 
@@ -40,11 +49,19 @@ impl BackpackingDataCollector {
                 .insert(person.clone(), Backpack::new(person.clone()));
         }
         self.vehicle_id2person_ids.clear();
+        self.person_id2vehicle_id.clear();
     }
 
     /// Records the person as an occupant of the vehicle and forwards the event to its backpack.
     #[hotpath::measure]
     pub(crate) fn person_enters_vehicle(&mut self, event: &PersonEntersVehicleEvent) {
+        if self.transit_runs.is_driver(&event.person) {
+            return;
+        }
+        let previous = self
+            .person_id2vehicle_id
+            .insert(event.person.clone(), event.vehicle.clone());
+        assert!(previous.is_none() || previous.as_ref() == Some(&event.vehicle));
         self.vehicle_id2person_ids
             .entry(event.vehicle.clone())
             .or_default()
@@ -56,49 +73,56 @@ impl BackpackingDataCollector {
     /// Removes the person from the occupants of the vehicle and forwards the event to its backpack.
     #[hotpath::measure]
     pub(crate) fn person_leaves_vehicle(&mut self, event: &PersonLeavesVehicleEvent) {
-        let remove_vehicle = self
-            .vehicle_id2person_ids
-            .get_mut(&event.vehicle)
-            .map(|persons| {
-                persons.remove(&event.person);
-                persons.is_empty()
-            })
-            .unwrap_or(false);
-        if remove_vehicle {
-            self.vehicle_id2person_ids.remove(&event.vehicle);
+        if self.transit_runs.is_driver(&event.person) {
+            return;
         }
-        self.partial_plan(&event.person)
-            .person_leaves_vehicle(event);
+        self.remove_vehicle_membership(&event.person);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.person_leaves_vehicle(event);
+        }
     }
 
     pub(crate) fn person_departure(&mut self, event: &PersonDepartureEvent) {
-        self.partial_plan(&event.person).person_departure(event);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.person_departure(event);
+        }
     }
 
     pub(crate) fn person_arrival(&mut self, event: &PersonArrivalEvent) {
-        self.partial_plan(&event.person).person_arrival(event);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.person_arrival(event);
+        }
     }
 
     pub(crate) fn activity_start(&mut self, event: &ActivityStartEvent) {
-        self.partial_plan(&event.person).activity_start(event);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.activity_start(event);
+        }
     }
 
     pub(crate) fn activity_end(&mut self, event: &ActivityEndEvent) {
-        self.partial_plan(&event.person).activity_end(event);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.activity_end(event);
+        }
     }
 
     pub(crate) fn teleportation_arrival(&mut self, event: &TeleportationArrivalEvent) {
-        self.partial_plan(&event.person)
-            .teleportation_arrival(event);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.teleportation_arrival(event);
+        }
     }
 
     pub(crate) fn pt_teleportation_arrival(&mut self, event: &PtTeleportationArrivalEvent) {
-        self.partial_plan(&event.person)
-            .pt_teleportation_arrival(event);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.pt_teleportation_arrival(event);
+        }
     }
 
     pub(crate) fn person_stuck(&mut self, event: &PersonStuckEvent) {
-        self.partial_plan(&event.person).person_stuck(event);
+        if let Some(plan) = self.partial_plan_for_person(&event.person) {
+            plan.person_stuck(event);
+        }
+        self.remove_vehicle_membership(&event.person);
     }
 
     pub(crate) fn link_enter(&mut self, event: &LinkEnterEvent) {
@@ -124,12 +148,39 @@ impl BackpackingDataCollector {
             return;
         };
         for person in persons {
+            if self.transit_runs.is_driver(person) {
+                continue;
+            }
             handle(Self::backpack(&mut self.person_id2backpack, person).partial_plan_mut());
         }
     }
 
+    fn partial_plan_for_person(&mut self, person: &Id<InternalPerson>) -> Option<&mut PartialPlan> {
+        if self.transit_runs.is_driver(person) {
+            return None;
+        }
+        Some(self.partial_plan(person))
+    }
+
     fn partial_plan(&mut self, person: &Id<InternalPerson>) -> &mut PartialPlan {
         Self::backpack(&mut self.person_id2backpack, person).partial_plan_mut()
+    }
+
+    fn remove_vehicle_membership(&mut self, person: &Id<InternalPerson>) {
+        let Some(vehicle) = self.person_id2vehicle_id.remove(person) else {
+            return;
+        };
+        let remove_vehicle = self
+            .vehicle_id2person_ids
+            .get_mut(&vehicle)
+            .map(|persons| {
+                persons.remove(person);
+                persons.is_empty()
+            })
+            .unwrap_or(false);
+        if remove_vehicle {
+            self.vehicle_id2person_ids.remove(&vehicle);
+        }
     }
 
     fn backpack<'a>(
@@ -146,9 +197,12 @@ impl BackpackingDataCollector {
 
     #[hotpath::measure]
     pub(crate) fn send(&mut self, entity: PartitionChangeEntity<'_>) -> BackpackingAttachment {
-        let person_ids = Self::person_ids(entity);
+        let person_ids = self.person_ids(entity);
         if let PartitionChangeEntity::Vehicle(vehicle) = entity {
             self.vehicle_id2person_ids.remove(vehicle.id());
+            for person in &person_ids {
+                self.person_id2vehicle_id.remove(person);
+            }
         }
 
         let backpacks = person_ids
@@ -173,7 +227,7 @@ impl BackpackingDataCollector {
         entity: PartitionChangeEntity<'_>,
         attachment: BackpackingAttachment,
     ) {
-        let expected_person_ids = Self::person_ids(entity);
+        let expected_person_ids = self.person_ids(entity);
         assert_eq!(
             attachment.backpacks.len(),
             expected_person_ids.len(),
@@ -194,6 +248,15 @@ impl BackpackingDataCollector {
                 "A backpack for arriving person {} is already present.",
                 expected_id.external()
             );
+            if let PartitionChangeEntity::Vehicle(vehicle) = entity {
+                let previous = self
+                    .person_id2vehicle_id
+                    .insert(expected_id.clone(), vehicle.id().clone());
+                assert!(
+                    previous.is_none(),
+                    "Arriving person already occupies a vehicle."
+                );
+            }
         }
 
         if let PartitionChangeEntity::Vehicle(vehicle) = entity {
@@ -209,13 +272,20 @@ impl BackpackingDataCollector {
         }
     }
 
-    fn person_ids(entity: PartitionChangeEntity<'_>) -> Vec<Id<InternalPerson>> {
+    fn person_ids(&self, entity: PartitionChangeEntity<'_>) -> Vec<Id<InternalPerson>> {
         match entity {
             PartitionChangeEntity::Vehicle(vehicle) => std::iter::once(vehicle.driver().id())
                 .chain(vehicle.passengers().iter().map(Identifiable::id))
+                .filter(|person| !self.transit_runs.is_driver(person))
                 .cloned()
                 .collect(),
-            PartitionChangeEntity::TeleportationAgent(agent) => vec![agent.id().clone()],
+            PartitionChangeEntity::TeleportationAgent(agent) => {
+                if self.transit_runs.is_driver(agent.id()) {
+                    Vec::new()
+                } else {
+                    vec![agent.id().clone()]
+                }
+            }
         }
     }
 
@@ -247,8 +317,11 @@ mod tests {
             Some(driver),
             vec![passenger],
         );
-        let mut departing =
-            BackpackingDataCollector::new(vec![driver_id.clone(), passenger_id.clone()]);
+        let transit_runs = Arc::new(TransitVehicleRuns::default());
+        let mut departing = BackpackingDataCollector::new(
+            vec![driver_id.clone(), passenger_id.clone()],
+            transit_runs.clone(),
+        );
         departing.reset_iteration();
         departing.vehicle_id2person_ids.insert(
             vehicle.id().clone(),
@@ -261,7 +334,7 @@ mod tests {
         assert!(departing.person_id2backpack.is_empty());
         assert!(departing.vehicle_id2person_ids.is_empty());
 
-        let mut arriving = BackpackingDataCollector::new(Vec::new());
+        let mut arriving = BackpackingDataCollector::new(Vec::new(), transit_runs);
         arriving.receive(PartitionChangeEntity::Vehicle(&vehicle), attachment);
         assert_eq!(arriving.person_id2backpack.len(), 2);
         let expected: IntSet<_> = [driver_id, passenger_id].into_iter().collect();

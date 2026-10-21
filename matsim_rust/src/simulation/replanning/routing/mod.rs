@@ -4580,6 +4580,7 @@ mod route_proposal_tests {
                 selected: true,
                 elements: Vec::new(),
                 attributes: InternalAttributes::default(),
+                msa_contributions: 0,
             },
         );
         let freight = InternalPerson::new(
@@ -4589,6 +4590,7 @@ mod route_proposal_tests {
                 selected: true,
                 elements: Vec::new(),
                 attributes: InternalAttributes::default(),
+                msa_contributions: 0,
             },
         )
         .with_subpopulation("freight");
@@ -5174,6 +5176,7 @@ mod route_proposal_tests {
                 selected: true,
                 elements: plan_elements,
                 attributes: InternalAttributes::default(),
+                msa_contributions: 0,
             },
         )]);
         let output = tempfile::tempdir().unwrap();
@@ -5673,6 +5676,7 @@ mod route_proposal_tests {
                 selected: true,
                 elements: Vec::new(),
                 attributes: InternalAttributes::default(),
+                msa_contributions: 0,
             },
         );
         if let Some(owns_car) = owns_car {
@@ -6450,6 +6454,7 @@ mod route_proposal_tests {
                     selected: true,
                     elements: Vec::new(),
                     attributes: InternalAttributes::default(),
+                    msa_contributions: 0,
                 },
             )
         };

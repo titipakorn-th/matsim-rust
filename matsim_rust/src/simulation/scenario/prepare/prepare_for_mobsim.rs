@@ -1192,6 +1192,7 @@ mod tests {
             transit_schedule: TransitSchedule::default(),
             facilities,
             config: Arc::new(config),
+            signals: Default::default(),
         };
         prepare_for_sim(&mut scenario).unwrap();
         let mut scenario: ControllerScenario = scenario.into();
@@ -1231,6 +1232,7 @@ mod tests {
             transit_schedule: TransitSchedule::default(),
             facilities: ActivityFacilities::default(),
             config: Arc::new(Config::default()),
+            signals: Default::default(),
         }
         .into()
     }
@@ -1248,6 +1250,7 @@ mod tests {
             transit_schedule: TransitSchedule::default(),
             facilities: ActivityFacilities::default(),
             config: Arc::new(config),
+            signals: Default::default(),
         }
         .into()
     }

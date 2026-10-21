@@ -350,6 +350,7 @@ mod tests {
                 selected: true,
                 elements: Vec::new(),
                 attributes: InternalAttributes::default(),
+                msa_contributions: 0,
             },
         );
         if let Some(owns_car) = owns_car {

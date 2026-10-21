@@ -311,7 +311,11 @@ mod tests {
     }
 
     fn equil_landmarks(number_of_landmarks: usize) -> Vec<String> {
-        let network = Network::from_file("./assets/equil/equil-network.xml");
+        let network = Network::from_file(
+            "./assets/equil/equil-network.xml",
+            1,
+            &crate::simulation::config::PartitionMethod::None,
+        );
         let graph = net_to_graph(&network);
         AltLandmarkData::choose_landmarks(&graph, number_of_landmarks)
             .unwrap()

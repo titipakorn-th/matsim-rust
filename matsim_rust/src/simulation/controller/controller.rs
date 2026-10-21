@@ -113,7 +113,6 @@ impl ControllerBuilder {
     // Implementing a custom build function in order to set the barrier if not set by the user.
     pub fn build(mut self) -> Result<Controller, String> {
         self.scenario.config.transit().validate()?;
-        self.scenario.config.travel_time_calculator().validate()?;
         self.scenario.config.scoring().validate()?;
         let transit = self.scenario.config.transit();
         if !transit.deterministic_service_modes.is_empty() && !transit.simulate_vehicles {
