@@ -795,18 +795,15 @@ fn home_plan(home: [f64; 2]) -> InternalPlan {
     let activity = |kind: &str, coord: Option<Coordinate>| {
         InternalPlanElement::Activity(InternalActivity::new(coord, kind, link(), None, None, None))
     };
-    InternalPlan {
-        score: None,
-        selected: true,
-        elements: vec![
-            activity("home", Some(Coordinate::new_2d(home[0], home[1]))),
-            // A stage activity after the home must not become the origin, or the person would
-            // be placed at a transit stop.
-            activity("pt interaction", Some(Coordinate::new_2d(2000.0, 2000.0))),
-            activity("work", Some(Coordinate::new_2d(-50.0, -50.0))),
-        ],
-        attributes: Default::default(),
-    }
+    let mut plan = InternalPlan::default();
+    plan.elements = vec![
+        activity("home", Some(Coordinate::new_2d(home[0], home[1]))),
+        // A stage activity after the home must not become the origin, or the person would
+        // be placed at a transit stop.
+        activity("pt interaction", Some(Coordinate::new_2d(2000.0, 2000.0))),
+        activity("work", Some(Coordinate::new_2d(-50.0, -50.0))),
+    ];
+    plan
 }
 
 /// Three people near z1 and one near z3, with no unplaceable person.
@@ -829,17 +826,16 @@ fn population() -> Population {
     let activity = |kind: &str, coord: Option<Coordinate>| {
         InternalPlanElement::Activity(InternalActivity::new(coord, kind, link(), None, None, None))
     };
-    let plan = |home: Option<Coordinate>| InternalPlan {
-        score: None,
-        selected: true,
-        elements: vec![
+    let plan = |home: Option<Coordinate>| {
+        let mut plan = InternalPlan::default();
+        plan.elements = vec![
             activity("home", home),
             // A stage activity before the first real one must not become the home, or the
             // person would be placed at a transit stop.
             activity("pt interaction", Some(Coordinate::new_2d(2000.0, 2000.0))),
             activity("work", Some(Coordinate::new_2d(-50.0, -50.0))),
-        ],
-        attributes: Default::default(),
+        ];
+        plan
     };
     Population::from_persons(vec![
         InternalPerson::new(
@@ -855,17 +851,13 @@ fn population() -> Population {
             plan(Some(Coordinate::new_2d(0.0, 900.0))),
         ),
         // Only a stage activity, so the plan has no home to place the person by.
-        InternalPerson::new(
-            Id::create("traveller"),
-            InternalPlan {
-                score: None,
-                selected: true,
-                elements: vec![activity(
-                    "pt interaction",
-                    Some(Coordinate::new_2d(500.0, 500.0)),
-                )],
-                attributes: Default::default(),
-            },
-        ),
+        InternalPerson::new(Id::create("traveller"), {
+            let mut plan = InternalPlan::default();
+            plan.elements = vec![activity(
+                "pt interaction",
+                Some(Coordinate::new_2d(500.0, 500.0)),
+            )];
+            plan
+        }),
     ])
 }

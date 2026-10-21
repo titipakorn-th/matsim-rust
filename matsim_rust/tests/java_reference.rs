@@ -11,7 +11,6 @@
 mod common;
 
 use macros::deterministic_id_test;
-use matsim_rust::simulation::InternalAttributes;
 use matsim_rust::simulation::config::{CommandLineArgs, Config};
 use matsim_rust::simulation::controller::controller::ControllerBuilder;
 use matsim_rust::simulation::events::utils::{read_events, read_partitioned_events};
@@ -2520,12 +2519,7 @@ fn person_specific_routing_costs_let_two_passengers_choose_different_services() 
         let person = &request["person"];
         InternalPerson::new(
             Id::create(person["id"].as_str().unwrap()),
-            InternalPlan {
-                score: None,
-                selected: true,
-                elements: Vec::new(),
-                attributes: InternalAttributes::default(),
-            },
+            InternalPlan::default(),
         )
         .with_subpopulation(person["subpopulation"].as_str().unwrap())
     };
@@ -2616,12 +2610,7 @@ fn combined_optional_routing_features_compose_like_the_pinned_reference() {
         let person = &request["person"];
         InternalPerson::new(
             Id::create(person["id"].as_str().unwrap()),
-            InternalPlan {
-                score: None,
-                selected: true,
-                elements: Vec::new(),
-                attributes: InternalAttributes::default(),
-            },
+            InternalPlan::default(),
         )
         .with_subpopulation(person["subpopulation"].as_str().unwrap())
     };

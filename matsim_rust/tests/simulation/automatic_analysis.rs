@@ -551,36 +551,28 @@ fn shared_analysis_reconstructs_staged_and_incomplete_journeys() {
             attributes: Default::default(),
         })
     };
-    let plan = InternalPlan {
-        score: None,
-        selected: true,
-        elements: vec![
-            activity("home"),
-            leg("walk", 900.0),
-            activity("pt interaction"),
-            leg("pt", 3000.0),
-            activity("pt interaction"),
-            leg("pt", 2000.0),
-            activity("pt interaction"),
-            leg("walk", 800.0),
-            activity("work"),
-            leg("car", 7000.0),
-            activity("home"),
-        ],
-        attributes: Default::default(),
-    };
-    let walking_plan = InternalPlan {
-        score: None,
-        selected: true,
-        elements: vec![
-            activity("home"),
-            leg("walk", 400.0),
-            activity("work"),
-            leg("car", 7000.0),
-            activity("home"),
-        ],
-        attributes: Default::default(),
-    };
+    let mut plan = InternalPlan::default();
+    plan.elements = vec![
+        activity("home"),
+        leg("walk", 900.0),
+        activity("pt interaction"),
+        leg("pt", 3000.0),
+        activity("pt interaction"),
+        leg("pt", 2000.0),
+        activity("pt interaction"),
+        leg("walk", 800.0),
+        activity("work"),
+        leg("car", 7000.0),
+        activity("home"),
+    ];
+    let mut walking_plan = InternalPlan::default();
+    walking_plan.elements = vec![
+        activity("home"),
+        leg("walk", 400.0),
+        activity("work"),
+        leg("car", 7000.0),
+        activity("home"),
+    ];
     let from_facility = ActivityFacility {
         id: Id::create("from"),
         coord: Coordinate::new_2d(0.0, 0.0),
@@ -613,12 +605,8 @@ fn shared_analysis_reconstructs_staged_and_incomplete_journeys() {
     let mut teleported_elements = vec![activity("home")];
     teleported_elements.extend(teleported_leg);
     teleported_elements.push(activity("work"));
-    let teleported_plan = InternalPlan {
-        score: None,
-        selected: true,
-        elements: teleported_elements,
-        attributes: Default::default(),
-    };
+    let mut teleported_plan = InternalPlan::default();
+    teleported_plan.elements = teleported_elements;
     let population = Population::from_persons(vec![
         InternalPerson::new(Id::create("p"), plan),
         InternalPerson::new(Id::create("walker"), walking_plan),

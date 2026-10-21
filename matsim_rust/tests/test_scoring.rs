@@ -1,5 +1,5 @@
 use macros::deterministic_id_test;
-use matsim_rust::simulation::config::{CommandLineArgs, Config, ScoringMode};
+use matsim_rust::simulation::config::{CommandLineArgs, Config, PartitionMethod, ScoringMode};
 use matsim_rust::simulation::controller::controller::ControllerBuilder;
 use matsim_rust::simulation::id::Id;
 use matsim_rust::simulation::io;
@@ -11,16 +11,19 @@ use matsim_rust::simulation::scenario::population::{
 use matsim_rust::simulation::scenario::vehicles::Garage;
 use matsim_rust::simulation::scoring::{OnlyTravelTimeDependentScoring, PlanScorer};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
 
 // This is just a regression test to ensure backpacking produces experienced plans.
 #[deterministic_id_test(matsim_rust)]
 fn backpacking_produces_partition_independent_experienced_plans() {
     let single = run_and_load("./tests/resources/equil/equil-config-1-scoring.yml");
     let partitioned = run_and_load("./tests/resources/equil/equil-config-2-scoring.yml");
-    let network = Network::from_file(Path::new("./assets/equil/equil-network.xml"));
+    let network = Network::from_file(
+        "./assets/equil/equil-network.xml",
+        1,
+        &PartitionMethod::None,
+    );
 
     assert!(!single.persons.is_empty());
     assert_eq!(single, partitioned);
@@ -270,11 +273,7 @@ fn check_plan_integrity(plan: &InternalPlan, network: &Network) {
                     .trav_time
                     .unwrap_or_else(|| panic!("Leg at element {index} has no travel time"));
                 assert_eq!(
-                    Some(
-                        departure
-                            .saturating_add(travel_time)
-                            .saturating_add(Duration::from_secs(1))
-                    ),
+                    Some(departure.saturating_add(travel_time)),
                     activity.start_time,
                     "Leg/activity times differ at element {index}"
                 );

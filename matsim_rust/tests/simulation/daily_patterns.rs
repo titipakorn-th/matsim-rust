@@ -139,18 +139,15 @@ fn leg(mode: &str, from: &str, to: &str) -> InternalPlanElement {
 
 /// A `home -> work -> home` day: three substantive activities and two journeys.
 fn day_plan(home: &str, work: &str) -> InternalPlan {
-    InternalPlan {
-        score: None,
-        selected: true,
-        attributes: Default::default(),
-        elements: vec![
-            activity("home", home),
-            leg("car", home, work),
-            activity("work", work),
-            leg("car", work, home),
-            activity("home", home),
-        ],
-    }
+    let mut plan = InternalPlan::default();
+    plan.elements = vec![
+        activity("home", home),
+        leg("car", home, work),
+        activity("work", work),
+        leg("car", work, home),
+        activity("home", home),
+    ];
+    plan
 }
 
 fn person(person_id: &str, home: &str, work: &str) -> InternalPerson {
@@ -429,21 +426,17 @@ fn a_stage_activity_never_counts_towards_a_reached_destination() {
     .join("\n");
     // The plan is `home, walk, pt interaction, pt, work`: three activities, of which the
     // transit interaction is a stage activity, so the plan counts two destinations.
-    let population = Population::from_persons(vec![InternalPerson::new(
-        Id::create("p"),
-        InternalPlan {
-            score: None,
-            selected: true,
-            attributes: Default::default(),
-            elements: vec![
-                activity("home", "home-link"),
-                leg("walk", "home-link", "walk-link"),
-                activity("pt interaction", "walk-link"),
-                leg("pt", "walk-link", "work-link"),
-                activity("work", "work-link"),
-            ],
-        },
-    )]);
+    let population = Population::from_persons(vec![InternalPerson::new(Id::create("p"), {
+        let mut plan = InternalPlan::default();
+        plan.elements = vec![
+            activity("home", "home-link"),
+            leg("walk", "home-link", "walk-link"),
+            activity("pt interaction", "walk-link"),
+            leg("pt", "walk-link", "work-link"),
+            activity("work", "work-link"),
+        ];
+        plan
+    })]);
 
     let report = analyze(
         &format!("<events>{events}</events>"),

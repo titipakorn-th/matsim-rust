@@ -1033,6 +1033,14 @@ register_override!("partitioning.num_parts", |config, value| {
     }
 });
 
+register_override!("partitioning.method", |config, value| {
+    config.partitioning_mut().method = match value.to_lowercase().as_str() {
+        "none" => PartitionMethod::None,
+        "metis" => PartitionMethod::Metis(MetisOptions::default()),
+        _ => panic!("Invalid partitioning method: {value}"),
+    };
+});
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Output {
     pub output_dir: PathBuf,
@@ -1307,6 +1315,14 @@ register_override!("output.output_dir", |config, value| {
 
 register_override!("output.overwrite_files", |config, value| {
     config.output_mut().overwrite_files = parse_overwrite_file(value);
+});
+
+register_override!("output.write_events", |config, value| {
+    config.output_mut().write_events = match value.to_lowercase().as_str() {
+        "none" => WriteEvents::None,
+        "file" => WriteEvents::File,
+        _ => panic!("Invalid write_events mode: {value}"),
+    };
 });
 
 // Analysis settings are opt-in and configurable, so both are reachable from the command line.
