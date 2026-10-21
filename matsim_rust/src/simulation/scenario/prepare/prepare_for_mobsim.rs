@@ -3,7 +3,7 @@ use crate::simulation::config::Config;
 use crate::simulation::id::Id;
 use crate::simulation::replanning::routing::utils::calc_distance;
 use crate::simulation::replanning::routing::{
-    Facility, RoutingError, RoutingRequestBuilder, TripRouter,
+    Facility, RoutingError, RoutingRequestBuilder, TripRouter, walking_travel_time,
 };
 use crate::simulation::scenario::ControllerScenario;
 use crate::simulation::scenario::facilities::ActivityFacilities;
@@ -35,19 +35,14 @@ pub(crate) fn prepare_for_mobsim(
         facilities: &scenario.core.facilities,
         config: scenario.core.config.as_ref(),
     };
-    let dispatch = tracing::dispatcher::get_default(Clone::clone);
 
     let issues: Vec<_> = scenario
         .population
         .persons
         .par_iter_mut()
         .flat_map(|(_, person)| {
-            tracing::dispatcher::with_default(&dispatch, || {
-                prepare_person(person, |person, plan| {
-                    tracing::dispatcher::with_default(&dispatch, || {
-                        prepare_plan(&context, person, plan, trip_router)
-                    })
-                })
+            prepare_person(person, |person, plan| {
+                prepare_plan(&context, person, plan, trip_router)
             })
         })
         .collect();
@@ -88,10 +83,10 @@ enum TripAssessment {
     NeedsRouting(Id<String>),
 }
 
-fn prepare_plan(
+fn prepare_plan<'a>(
     context: &PrepareForMobsimContext<'_>,
     person: &InternalPerson,
-    plan: &InternalPlan,
+    plan: &'a InternalPlan,
     trip_router: &TripRouter,
 ) -> Result<Option<InternalPlan>, PlanPreparationFailure> {
     // `Cow` works as follows: borrow the plan and if it needs to be mutated, clone it.
@@ -125,10 +120,65 @@ fn check_and_adapt_trip(
         return Ok(());
     };
 
-    let new_elements = route_trip(context, person, working_plan, span, &mode, trip_router)?;
+    let new_elements = match route_trip(context, person, working_plan, span, &mode, trip_router) {
+        Ok(elements) => elements,
+        Err(error)
+            if context.config.routing().discard_infeasible_trips && is_infeasible_route(&error) =>
+        {
+            let walk = Id::get_from_ext("walk");
+            let fallback =
+                if mode != walk && context.config.routing().max_walk_duration_seconds.is_some() {
+                    match route_trip(context, person, working_plan, span, &walk, trip_router) {
+                        Ok(elements) => Some(elements),
+                        Err(error) if is_infeasible_route(&error) => None,
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    None
+                };
+            if let Some(elements) = fallback {
+                tracing::warn!(person = %person.id(), trip_index, original_mode = %mode,
+                    "Replaced infeasible trip with a bounded direct walk");
+                elements
+            } else {
+                tracing::warn!(person = %person.id(), trip_index, reason = %error,
+                    "Trip will be abandoned without an arrival event");
+                let origin = span.origin(&working_plan.elements);
+                let destination = span.destination(&working_plan.elements);
+                // This route carries the next activity's partition, not a performed journey.
+                let route = InternalRoute::Generic(InternalGenericRoute::new(
+                    origin.link_id().clone(),
+                    destination.link_id().clone(),
+                    Some(std::time::Duration::ZERO),
+                    Some(0.0),
+                    None,
+                ));
+                let mut leg = InternalLeg::new(
+                    route,
+                    mode.external(),
+                    mode.external(),
+                    std::time::Duration::ZERO,
+                    None,
+                );
+                leg.attributes
+                    .insert(InternalLeg::INFEASIBLE_TRIP_REASON, error.to_string());
+                vec![InternalPlanElement::Leg(leg)]
+            }
+        }
+        Err(error) => return Err(error),
+    };
 
     span.replace_trip_elements(&mut working_plan.to_mut().elements, new_elements);
     Ok(())
+}
+
+fn is_infeasible_route(error: &TripPreparationError) -> bool {
+    matches!(
+        error,
+        TripPreparationError::Routing(
+            RoutingError::NoPath { .. } | RoutingError::WalkingLimitExceeded { .. }
+        )
+    )
 }
 
 pub(crate) fn route_trip(
@@ -149,7 +199,8 @@ pub(crate) fn route_trip(
     let dest = span.destination(&plan.elements);
     let from_facility = facility_for_activity(context, origin, mode)?;
     let to_facility = facility_for_activity(context, dest, mode)?;
-    let vehicle = vehicle_for_trip(context, person, span, &plan.elements, mode)?;
+    let vehicle = vehicle_for_trip(context, person, mode)?;
+
     let request = RoutingRequestBuilder::default()
         .from(&from_facility)
         .to(&to_facility)
@@ -158,26 +209,7 @@ pub(crate) fn route_trip(
         .vehicle(vehicle)
         .build()
         .expect("all required routing request fields are set");
-    // Split preparation time between transit search and network routing, so a slow run can be
-    // attributed to the right engine. No-op unless the `hotpath` feature is enabled.
-    let is_transit = context
-        .config
-        .transit()
-        .transit_modes
-        .iter()
-        .any(|transit_mode| transit_mode == mode.external());
-    let routed = if is_transit {
-        hotpath::measure_block!(
-            "prepare.route.transit",
-            trip_router.calc_route(mode, request)
-        )
-    } else {
-        hotpath::measure_block!(
-            "prepare.route.network",
-            trip_router.calc_route(mode, request)
-        )
-    };
-    Ok(routed?)
+    Ok(trip_router.calc_route(mode, request)?)
 }
 
 /// Each activity takes place at a facility. Activities without a facility are routed via a link
@@ -301,6 +333,25 @@ fn trip_is_valid(
     mode: &Id<String>,
     legs: &[&InternalLeg],
 ) -> bool {
+    if !context.config.routing().network_access_egress
+        && is_network_mode(context, mode)
+        && (legs.len() != 1 || legs[0].mode != *mode)
+    {
+        return false;
+    }
+    // Retry previously abandoned trips against this iteration's routing conditions.
+    if legs
+        .iter()
+        .any(|leg| leg.infeasible_trip_reason().is_some())
+    {
+        return false;
+    }
+    if let Some(maximum) = context.config.routing().max_walk_duration_seconds
+        && !walking_travel_time(span.trip_elements(elements))
+            .is_ok_and(|walking| walking <= std::time::Duration::from_secs(maximum))
+    {
+        return false;
+    }
     let any_leg_wrong_routing_mode = legs
         .iter()
         .any(|leg| leg.routing_mode.as_ref() != Some(mode));
@@ -390,35 +441,21 @@ fn network_route_is_valid(
         && links.windows(2).all(|pair| pair[0].to == pair[1].from)
 }
 
+/// Returns the vehicle a trip with routing `mode` is routed with: the vehicle `<person>_<mode>`
+/// for modes that have vehicles, see [`mode_has_vehicle`], and none for all other modes.
 fn vehicle_for_trip<'a>(
     context: &'a PrepareForMobsimContext<'_>,
     person: &InternalPerson,
-    span: TripSpan,
-    elements: &[InternalPlanElement],
     mode: &Id<String>,
 ) -> Result<Option<&'a InternalVehicle>, TripPreparationError> {
-    if !is_network_mode(context, mode) {
+    if !mode_has_vehicle(context, mode) {
         return Ok(None);
     }
 
-    if let Some(vehicle) = span
-        .legs(elements)
-        .filter(|leg| &leg.mode == mode)
-        .filter_map(|leg| leg.route.as_ref())
-        .filter(|route| matches!(route, InternalRoute::Network(_)))
-        .filter_map(|route| route.as_generic().vehicle().as_ref())
-        .find_map(|vehicle_id| context.garage.vehicles.get(vehicle_id))
-    {
-        return Ok(Some(vehicle));
-    }
-
     let default_id = format!("{}_{}", person.id().external(), mode.external());
-    context
-        .garage
-        .vehicles
-        .iter()
-        .find(|(id, _)| id.external() == default_id)
-        .map(|(_, vehicle)| Some(vehicle))
+    Id::<InternalVehicle>::try_get_from_ext(&default_id)
+        .and_then(|id| context.garage.vehicles.get(&id))
+        .map(Some)
         .ok_or_else(|| TripPreparationError::MissingVehicle {
             mode: mode.external().to_string(),
             default_vehicle: default_id,
@@ -434,19 +471,28 @@ fn is_network_mode(context: &PrepareForMobsimContext<'_>, mode: &Id<String>) -> 
         .any(|candidate| candidate == mode.external())
 }
 
+/// Whether persons have a vehicle for `mode`. As in MATSim (`PrepareForSimImpl`), these are the
+/// modes simulated on the network and the modes routed on the network, even if they are teleported.
+fn mode_has_vehicle(context: &PrepareForMobsimContext<'_>, mode: &Id<String>) -> bool {
+    is_network_mode(context, mode)
+        || context
+            .config
+            .routing()
+            .network_modes
+            .iter()
+            .any(|candidate| candidate == mode.external())
+}
+
 #[cfg(test)]
 mod tests {
     use super::add_travel_distance;
     use super::prepare_for_mobsim;
     use crate::simulation::InternalAttributes;
-    use crate::simulation::config::{
-        Config, ModalLinkSelection, TransitRangeQuerySettings, TransitRouteSelectorSettings,
-    };
+    use crate::simulation::config::{Config, ModalLinkSelection};
     use crate::simulation::id::Id;
-    use crate::simulation::network::signals::Signals;
     use crate::simulation::replanning::routing::teleportation::TeleportationRoutingModule;
     use crate::simulation::replanning::routing::{
-        RoutingError, RoutingModule, RoutingRequest, TransitRoutingModule, TripRouter,
+        RoutingError, RoutingModule, RoutingRequest, TripRouter,
     };
     use crate::simulation::scenario::facilities::ActivityFacilities;
     use crate::simulation::scenario::network::{Link, Network, Node};
@@ -504,92 +550,6 @@ mod tests {
                 .population
                 .persons
                 .contains_key(&Id::get_from_ext("person-2"))
-        );
-    }
-
-    #[deterministic_id_test]
-    fn prepares_a_transit_range_route_into_the_selected_plan() {
-        let person_id = Id::create("range-person");
-        let mut plan = InternalPlan::default();
-        plan.add_act(InternalActivity::new(
-            Some(Coordinate::new_2d(1050.0, 1050.0)),
-            "home",
-            Id::create("link-1"),
-            None,
-            Some(SimTime::from_secs(8 * 3600)),
-            None,
-        ));
-        plan.add_leg(unrouted_leg("pt"));
-        plan.add_act(InternalActivity::new(
-            Some(Coordinate::new_2d(3950.0, 1050.0)),
-            "work",
-            Id::create("link-2"),
-            None,
-            None,
-            None,
-        ));
-        let mut persons = IntMap::default();
-        persons.insert(
-            person_id.clone(),
-            InternalPerson::new(person_id.clone(), plan),
-        );
-        let mut modules: IntMap<Id<String>, Arc<dyn RoutingModule>> = IntMap::default();
-        let mode = Id::create("pt");
-        modules.insert(
-            mode.clone(),
-            Arc::new(
-                TransitRoutingModule::new(
-                    Arc::new(TransitSchedule::from_file(
-                        "./tests/resources/pt_reference/routing_direct_vs_transfer/transit_schedule.xml"
-                            .as_ref(),
-                    )),
-                    0.8333333333333334,
-                    1.3,
-                    Arc::new(Garage::default()),
-                    None,
-                )
-                .with_range_queries(
-                    vec![TransitRangeQuerySettings {
-                        max_earlier_departure_sec: 120,
-                        max_later_departure_sec: 120,
-                        subpopulations: Vec::new(),
-                    }],
-                    vec![TransitRouteSelectorSettings::default()],
-                    4711,
-                ),
-            ),
-        );
-        let mut scenario = scenario_with_parts(
-            sequential_network(2, None),
-            Garage::default(),
-            Population { persons },
-            Config::default(),
-        );
-
-        prepare_for_mobsim(&mut scenario, &TripRouter::new(modules)).unwrap();
-
-        let prepared = scenario.population.persons[&person_id]
-            .selected_plan()
-            .unwrap();
-        assert!(
-            prepared.legs().len() >= 3,
-            "access, transit and egress legs remain in the plan"
-        );
-        assert!(
-            prepared
-                .legs()
-                .iter()
-                .any(|leg| leg.mode.external() == "pt")
-        );
-        assert!(
-            prepared
-                .legs()
-                .iter()
-                .all(|leg| leg.routing_mode.as_ref() == Some(&mode))
-        );
-        assert_eq!(
-            Some(SimTime::from_secs(8 * 3600)),
-            prepared.acts()[0].end_time
         );
     }
 
@@ -663,6 +623,40 @@ mod tests {
         assert_eq!(
             Some(travel_time),
             legs[0].route.as_ref().unwrap().as_generic().trav_time()
+        );
+    }
+
+    #[deterministic_id_test]
+    fn walk_limit_rechecks_already_routed_plans_in_use_plans_mode() {
+        let duration = Duration::from_secs(3601);
+        let plan = routed_plan("walk", Some(duration), Some(duration));
+        let person_id = Id::create("long-walker");
+        let mut config = Config::default();
+        config.routing_mut().max_walk_duration_seconds = Some(3600);
+        let mut scenario = scenario_with_parts(
+            sequential_network(2, None),
+            Garage::default(),
+            Population {
+                persons: IntMap::from_iter([(
+                    person_id.clone(),
+                    InternalPerson::new(person_id.clone(), plan.clone()),
+                )]),
+            },
+            config,
+        );
+        let error = prepare_for_mobsim(&mut scenario, &empty_router()).unwrap_err();
+        assert_eq!(error.issues().len(), 1);
+        assert_eq!(error.issues()[0].person_id, "long-walker");
+        assert!(
+            error.issues()[0]
+                .message
+                .contains("No routing module found")
+        );
+        assert_eq!(
+            scenario.population.persons[&person_id]
+                .selected_plan()
+                .unwrap(),
+            &plan
         );
     }
 
@@ -944,6 +938,119 @@ mod tests {
         );
     }
 
+    // Before: act--car with a network route in vehicle other-car, but without access/egress--act;
+    // after: the trip is routed with the default vehicle person-1_car, as in MATSim.
+    #[deterministic_id_test]
+    fn rerouted_trip_uses_default_vehicle_instead_of_route_vehicle() {
+        let departures = Arc::new(Mutex::new(Vec::new()));
+        let router = network_test_router(departures.clone());
+        let mut config = Config::default();
+        config.qsim_mut().main_modes = vec!["car".to_string()];
+        let mut garage = Garage::default();
+        garage.add_veh(test_vehicle("person-1_car"));
+        garage.add_veh(test_vehicle("other-car"));
+        let mut plan = unrouted_plan("car", "link-1", "link-2", 10);
+        let InternalPlanElement::Leg(leg) = &mut plan.elements[1] else {
+            unreachable!()
+        };
+        leg.route = Some(InternalRoute::Network(InternalNetworkRoute::new(
+            InternalGenericRoute::new(
+                Id::create("link-1"),
+                Id::create("link-2"),
+                None,
+                Some(10.0),
+                Some(Id::create("other-car")),
+            ),
+            vec![Id::create("link-1"), Id::create("link-2")],
+        )));
+        let person_id = Id::create("person-1");
+        let mut persons = IntMap::default();
+        persons.insert(
+            person_id.clone(),
+            InternalPerson::new(person_id.clone(), plan),
+        );
+        let mut scenario = scenario_with_parts(
+            sequential_network(2, Some("car")),
+            garage,
+            Population { persons },
+            config,
+        );
+
+        prepare_for_mobsim(&mut scenario, &router).unwrap();
+
+        assert_eq!(vec![SimTime::from_secs(10)], *departures.lock().unwrap());
+        let plan = scenario.population.persons[&person_id]
+            .selected_plan()
+            .unwrap();
+        assert_eq!(vec!["walk", "car", "walk"], leg_modes(plan));
+        assert_eq!("person-1_car", main_leg_vehicle(plan));
+    }
+
+    // Before: act--unrouted car--act, car is routed on the network but teleported in the mobsim;
+    // after: the trip is routed with the default vehicle person-1_car, as in MATSim.
+    #[deterministic_id_test]
+    fn network_routed_mode_outside_main_modes_is_routed_with_default_vehicle() {
+        let departures = Arc::new(Mutex::new(Vec::new()));
+        let router = network_test_router(departures.clone());
+        let mut config = Config::default();
+        config.routing_mut().network_modes = vec!["car".to_string()];
+        let mut garage = Garage::default();
+        garage.add_veh(test_vehicle("person-1_car"));
+        let person_id = Id::create("person-1");
+        let mut persons = IntMap::default();
+        persons.insert(
+            person_id.clone(),
+            InternalPerson::new(
+                person_id.clone(),
+                unrouted_plan("car", "link-1", "link-2", 10),
+            ),
+        );
+        let mut scenario = scenario_with_parts(
+            sequential_network(2, Some("car")),
+            garage,
+            Population { persons },
+            config,
+        );
+
+        prepare_for_mobsim(&mut scenario, &router).unwrap();
+
+        assert_eq!(vec![SimTime::from_secs(10)], *departures.lock().unwrap());
+        let plan = scenario.population.persons[&person_id]
+            .selected_plan()
+            .unwrap();
+        assert_eq!("person-1_car", main_leg_vehicle(plan));
+    }
+
+    // Before: act--unrouted car--act, car is routed on the network but no vehicle exists;
+    // after: preparation fails without calling the router.
+    #[deterministic_id_test]
+    fn missing_vehicle_of_network_routed_mode_is_reported_without_calling_router() {
+        let departures = Arc::new(Mutex::new(Vec::new()));
+        let router = network_test_router(departures.clone());
+        let mut config = Config::default();
+        config.routing_mut().network_modes = vec!["car".to_string()];
+        let person_id = Id::create("person-1");
+        let mut persons = IntMap::default();
+        persons.insert(
+            person_id.clone(),
+            InternalPerson::new(
+                person_id.clone(),
+                unrouted_plan("car", "link-1", "link-2", 10),
+            ),
+        );
+        let mut scenario = scenario_with_parts(
+            sequential_network(2, Some("car")),
+            Garage::default(),
+            Population { persons },
+            config,
+        );
+
+        let error = prepare_for_mobsim(&mut scenario, &router).unwrap_err();
+
+        assert!(error.issues()[0].message.contains("person-1_car"));
+        assert!(departures.lock().unwrap().is_empty());
+    }
+
     // Before: act without an end time--unrouted car--act; after: preparation fails and the plan is unchanged.
     #[deterministic_id_test]
     fn missing_departure_time_is_reported_without_calling_router_or_replacing_plan() {
@@ -1125,7 +1232,7 @@ mod tests {
             transit_schedule: TransitSchedule::default(),
             facilities: ActivityFacilities::default(),
             config: Arc::new(Config::default()),
-            signals: Signals::default(),
+            signals: Default::default(),
         }
         .into()
     }
@@ -1143,7 +1250,7 @@ mod tests {
             transit_schedule: TransitSchedule::default(),
             facilities: ActivityFacilities::default(),
             config: Arc::new(config),
-            signals: Signals::default(),
+            signals: Default::default(),
         }
         .into()
     }
@@ -1287,6 +1394,22 @@ mod tests {
             .into_iter()
             .map(|leg| leg.mode.external())
             .collect()
+    }
+
+    /// The vehicle of the only leg with a network route.
+    fn main_leg_vehicle(plan: &InternalPlan) -> &str {
+        let network_routes: Vec<_> = plan
+            .legs()
+            .into_iter()
+            .filter_map(|leg| leg.route.as_ref()?.as_network())
+            .collect();
+        assert_eq!(1, network_routes.len());
+        network_routes[0]
+            .generic_delegate()
+            .vehicle()
+            .as_ref()
+            .expect("network route has a vehicle")
+            .external()
     }
 
     /// Dummy routing module that stores the departure times of the requests and returns a walk (0s) -> car (10s) -> walk (0s) trip.

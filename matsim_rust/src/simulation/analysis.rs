@@ -4704,6 +4704,7 @@ mod tests {
                 activity("work"),
             ],
             attributes: InternalAttributes::default(),
+            msa_contributions: 0,
         };
         let overflow_plan = InternalPlan {
             score: None,
@@ -4716,6 +4717,7 @@ mod tests {
                 activity("work"),
             ],
             attributes: InternalAttributes::default(),
+            msa_contributions: 0,
         };
         let population = Population::from_persons(vec![
             InternalPerson::new(Id::create("person"), plan),

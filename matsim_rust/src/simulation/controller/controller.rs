@@ -113,7 +113,6 @@ impl ControllerBuilder {
     // Implementing a custom build function in order to set the barrier if not set by the user.
     pub fn build(mut self) -> Result<Controller, String> {
         self.scenario.config.transit().validate()?;
-        self.scenario.config.travel_time_calculator().validate()?;
         self.scenario.config.scoring().validate()?;
         let transit = self.scenario.config.transit();
         if !transit.deterministic_service_modes.is_empty() && !transit.simulate_vehicles {
@@ -180,8 +179,12 @@ impl ControllerBuilder {
                 }
             }
         }
+        let bin_size = self
+            .scenario
+            .config
+            .travel_time_calculator()
+            .bin_duration(self.scenario.config.qsim().ticks_per_second)?;
         let num_parts = self.scenario.config.partitioning().num_parts;
-        let bin_size = self.scenario.config.travel_time_calculator().bin_size;
         let end_time = self.scenario.config.qsim().end_time;
 
         // create a barrier for the number of partitions, if not provided
@@ -230,7 +233,7 @@ impl ControllerBuilder {
 
         let global_ttc = Arc::new(GlobalTravelTimeCalculator::new(
             num_parts as usize,
-            Duration::from_secs(u64::from(config.travel_time_calculator().bin_size)),
+            bin_size,
             Duration::from_secs(u64::from(config.qsim().end_time)),
         ));
         let router = Self::create_trip_router(
@@ -245,7 +248,7 @@ impl ControllerBuilder {
             let global_ttc = global_ttc.clone();
             let travel_time_collector = move || {
                 Rc::new(RefCell::new(PartitionTravelTimeCollector::new(
-                    Duration::from_secs(u64::from(bin_size)),
+                    bin_size,
                     Duration::from_secs(u64::from(end_time)),
                 )))
             };
@@ -539,7 +542,13 @@ impl ControllerBuilder {
                 config.transit().route_selector_settings.clone(),
                 config.computational_setup().random_seed,
             )
-            .with_transfer_penalty(config.transit().transfer_penalty.clone());
+            .with_transfer_penalty(config.transit().transfer_penalty.clone())
+            .with_max_walk_duration(
+                config
+                    .routing()
+                    .max_walk_duration_seconds
+                    .map(std::time::Duration::from_secs),
+            );
             if config.transit().use_intermodal_access_egress {
                 if config.transit().intermodal_access_egress.is_empty() {
                     return Err("transit.use_intermodal_access_egress requires at least one transit.intermodal_access_egress entry".to_owned());
@@ -595,7 +604,12 @@ impl ControllerBuilder {
             routers.insert(mode, Arc::new(transit_router));
         }
 
-        Ok(TripRouter::new(routers))
+        Ok(TripRouter::new(routers).with_max_walk_duration(
+            config
+                .routing()
+                .max_walk_duration_seconds
+                .map(std::time::Duration::from_secs),
+        ))
     }
 }
 
@@ -918,7 +932,7 @@ impl Controller {
             "Scoring population of {} persons in iteration {iteration}",
             population.persons.len()
         );
-        scoring_pool.score_population(&mut experienced_plans, &mut population);
+        scoring_pool.score_population(&mut experienced_plans, &mut population, iteration);
         info!("Finished scoring population in iteration {iteration}");
 
         if self.config.scoring().write_experienced_plans
